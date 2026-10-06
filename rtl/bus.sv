@@ -63,6 +63,11 @@ module bus #(
 
     logic [1:0]   state;
     logic [OW-1:0] rr, owner, win;
+    // 32-bit zero-extended copies for comparisons with loop indices (Yosys 0.33
+    // does not parse int'() casts).
+    wire [31:0] rr32    = {{(32-OW){1'b0}}, rr};
+    wire [31:0] owner32 = {{(32-OW){1'b0}}, owner};
+    wire [31:0] win32   = {{(32-OW){1'b0}}, win};
     logic         found;
     logic [2:0]   cmd;
     logic [31:0]  addr;
@@ -80,7 +85,7 @@ module bus #(
         win = '0;
         for (int i = 0; i < M; i++) begin
             int j;
-            j = int'(rr) + i;
+            j = rr32 + i;
             if (j >= M) j = j - M;
             if (!found && reqs[j]) begin
                 found = 1'b1;
@@ -100,13 +105,13 @@ module bus #(
         w_wdata = 128'd0;
         w_wstrb = 16'd0;
         for (int k = 0; k < N; k++) begin
-            if (int'(win) == k) begin
+            if (win32 == k) begin
                 w_cmd = d_cmd[3*k +: 3];
                 w_addr = d_addr[32*k +: 32];
                 w_wdata = d_wdata[128*k +: 128];
                 w_wstrb = d_wstrb[16*k +: 16];
             end
-            if (int'(win) == N + k) w_addr = i_addr[32*k +: 32];
+            if (win32 == N + k) w_addr = i_addr[32*k +: 32];
         end
     end
 
@@ -114,7 +119,7 @@ module bus #(
     // fetch, all of them)
     logic [N-1:0] snoopers;
     always_comb begin
-        for (int k = 0; k < N; k++) snoopers[k] = (int'(win) != k);
+        for (int k = 0; k < N; k++) snoopers[k] = (win32 != k);
     end
 
     logic coherent;
@@ -157,7 +162,7 @@ module bus #(
             case (state)
                 B_IDLE: if (found) begin
                     owner <= win;
-                    rr <= (int'(win) == M - 1) ? '0 : win + 1'b1;
+                    rr <= (win32 == M - 1) ? '0 : win + 1'b1;
                     cmd <= w_cmd;
                     addr <= w_addr;
                     wdata <= w_wdata;
@@ -206,14 +211,14 @@ module bus #(
     // response
     always_comb begin
         for (int k = 0; k < N; k++) begin
-            d_ack[k] = (state == B_RESP) && int'(owner) == k;
-            i_ack[k] = (state == B_RESP) && int'(owner) == N + k;
+            d_ack[k] = (state == B_RESP) && owner32 == k;
+            i_ack[k] = (state == B_RESP) && owner32 == N + k;
         end
     end
     assign rdata = line;
     assign shared = shr;
 
     assign trace = {(state == B_RESP), sup_v, shr, (state == B_IDLE && found),
-                    (state == B_IDLE) ? 4'(win) : 4'(owner), (state == B_IDLE) ? w_cmd : cmd, 21'd0,
+                    (state == B_IDLE) ? {{(4-OW){1'b0}}, win} : {{(4-OW){1'b0}}, owner}, (state == B_IDLE) ? w_cmd : cmd, 21'd0,
                     (state == B_IDLE) ? w_addr : addr};
 endmodule

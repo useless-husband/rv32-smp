@@ -248,6 +248,9 @@ module l1d #(
     assign resv_hit = resv_v && resv_line == sp_addr[31:4];
 
     logic [5:0] lock_cnt;
+
+    localparam logic [31:0] LOCKOUT32 = LOCKOUT;  // no size cast: Yosys 0.33
+    localparam logic [5:0]  LOCKOUT6  = LOCKOUT32[5:0];
     assign defer = (state == IDLE) && lock_cnt != 6'd0 && resv_hit && sp_cmd != `CMD_IRD;
     assign snoop_start = sp && !defer && (state != SNP);
 
@@ -328,7 +331,7 @@ module l1d #(
                 if (is_lr) begin
                     resv_v <= 1'b1;
                     resv_line <= addr[31:4];
-                    lock_cnt <= 6'(LOCKOUT);
+                    lock_cnt <= LOCKOUT6;
                 end
                 if (is_sc) begin
                     resv_v <= 1'b0;
@@ -378,7 +381,7 @@ module l1d #(
                         if (is_lr) begin
                             resv_v <= 1'b1;
                             resv_line <= addr[31:4];
-                            lock_cnt <= 6'(LOCKOUT);
+                            lock_cnt <= LOCKOUT6;
                         end
                         if (is_sc) begin
                             resv_v <= 1'b0;

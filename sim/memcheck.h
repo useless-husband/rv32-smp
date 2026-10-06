@@ -58,7 +58,7 @@ struct MemCheck {
         for (size_t i = 0; i < t.size(); i++)
             for (size_t j = i + 1; j < t.size(); j++)
                 if (t[i].perf && t[j].perf && (t[i].perf_addr >> 4) == (t[j].perf_addr >> 4) &&
-                    (writes_mem(t[i]) || writes_mem(t[j]))) {
+                    writes_mem(t[i]) && writes_mem(t[j])) {
                     char b[200];
                     std::snprintf(b, sizeof b,
                                   "cycle %llu: harts %zu and %zu access line %08x in the same cycle, one of "
@@ -67,8 +67,14 @@ struct MemCheck {
                     error = b;
                     return false;
                 }
+        // apply reads before writes in the same cycle: a read and a write to one
+        // line in one cycle linearise as read-then-write (the atomic bus never
+        // grants two writers the same line at once, checked just above)
         for (size_t h = 0; h < t.size(); h++)
-            if (t[h].perf && !perform(cyc, (int)h, t[h]))
+            if (t[h].perf && !writes_mem(t[h]) && !perform(cyc, (int)h, t[h]))
+                return false;
+        for (size_t h = 0; h < t.size(); h++)
+            if (t[h].perf && writes_mem(t[h]) && !perform(cyc, (int)h, t[h]))
                 return false;
         return true;
     }

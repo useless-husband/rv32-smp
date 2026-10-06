@@ -1,0 +1,11 @@
+build/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+results.xml
+*.vcd
+*.fst
+obj_dir/
+.DS_Store
+data/

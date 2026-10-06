@@ -177,4 +177,14 @@ litmus: build/vsmp4 build/sw/litmus.elf litmus-fetch
 system: $(SIMS) $(BUG_SIMS) rvtests sw build/rvsim
 	$(PYTHON) -m pytest -q tests/system
 
+bench: $(SIMS) build/sw/bench.elf build/sw/false_sharing.elf
+	$(PYTHON) tools/bench.py
+
+# ----------------------------------------------------------------- synthesis
+SYNTH_RTL := $(RTL) synth/smp_core.sv
+synth: loopcheck
+	@mkdir -p build/synth
+	for n in 1 2 4; do 	  $(YOSYS) -q -l build/synth/area$$n.log -p "read_verilog -sv -Irtl $(SYNTH_RTL); 	    chparam -set NHARTS $$n smp_core; synth_xilinx -family xc7 -top smp_core -flatten; 	    tee -q -o build/synth/stat$$n.json stat -json" > /dev/null 2>&1 || { tail -20 build/synth/area$$n.log; exit 1; }; 	  $(YOSYS) -q -l build/synth/depth$$n.log -p "read_verilog -sv -Irtl $(SYNTH_RTL); 	    chparam -set NHARTS $$n smp_core; synth_xilinx -family xc7 -top smp_core -flatten -nodsp -nolutram; 	    delete t:FD* t:RAMB*; ltp -noff" > /dev/null 2>&1 || { tail -20 build/synth/depth$$n.log; exit 1; }; 	done
+	$(PYTHON) tools/synth_report.py
+
 test: lint loopcheck iss-test mc system

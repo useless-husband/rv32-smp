@@ -1,6 +1,10 @@
-/* Start-up code for bare-metal C programs: clear the registers, set up the
- * stack, global pointer and trap vector, zero .bss, run main() and pass its
- * return value to exit(). */
+/* Start-up code for bare-metal C programs on every hart.
+ *
+ * All harts start here after reset.  Each one clears its registers, sets up
+ * the global pointer, its own 16 KiB stack (hart k: the k-th block below the
+ * top of RAM) and the trap vector.  Hart 0 zeroes .bss, releases the others
+ * and runs main(); its return value goes to exit().  The other harts wait for
+ * the release and then for work from rt_run_all() (smp.c). */
 #include "rv_platform.h"
 
         .section .text.init
@@ -13,26 +17,35 @@ _start:
         .option norelax
         la gp, __global_pointer$
         .option pop
+        csrr s0, mhartid
         la sp, __stack_top
+        slli t0, s0, 14
+        sub sp, sp, t0
         la t0, rt_trap_entry
         csrw mtvec, t0
-#ifdef __riscv_flen
-        /* built for a core with the FPU: turn it on (mstatus.FS = initial),
-         * round to nearest, no flags */
-        li t0, 0x2000
-        csrs mstatus, t0
-        csrwi fcsr, 0
-#endif
+        bnez s0, 3f
         la t0, __bss_start
         la t1, __bss_end
 1:      bgeu t0, t1, 2f
         sw zero, 0(t0)
         addi t0, t0, 4
         j 1b
-2:      li a0, 0
+2:      fence rw, rw
+        la t0, rt_boot_released
+        li t1, 1
+        sw t1, 0(t0)
+        li a0, 0
         li a1, 0
         call main
         call exit
+        /* the other harts: wait until hart 0 has zeroed .bss */
+3:      la t0, rt_boot_released
+4:      lw t1, 0(t0)
+        beqz t1, 4b
+        fence rw, rw
+        mv a0, s0
+        call rt_secondary
+5:      j 5b
 
 /* Any trap in a C program is a bug: report it and stop with exit code 99. */
         .align 2
@@ -40,6 +53,9 @@ rt_trap_entry:
         csrr a0, mcause
         csrr a1, mepc
         csrr a2, mtval
+        csrr a3, mhartid
         la sp, __stack_top
+        slli a4, a3, 14
+        sub sp, sp, a4
         call rt_unexpected_trap
-3:      j 3b
+6:      j 6b

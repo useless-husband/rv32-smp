@@ -28,10 +28,10 @@ void exit(int code)
         ;
 }
 
-void rt_unexpected_trap(uint32_t cause, uint32_t epc, uint32_t tval)
+void rt_unexpected_trap(uint32_t cause, uint32_t epc, uint32_t tval, uint32_t hart)
 {
-    printf("\nunexpected trap: mcause=%u mepc=0x%08x mtval=0x%08x\n", (unsigned)cause, (unsigned)epc,
-           (unsigned)tval);
+    printf("\nunexpected trap on hart %u: mcause=%u mepc=0x%08x mtval=0x%08x\n", (unsigned)hart, (unsigned)cause,
+           (unsigned)epc, (unsigned)tval);
     exit(99);
 }
 

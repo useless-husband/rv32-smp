@@ -7,7 +7,8 @@
 # calls instead of Verilator's own makefiles.
 
 SHELL := /bin/bash
-PYTHON ?= python3
+VENV ?= .venv
+PYTHON ?= $(if $(wildcard $(VENV)/bin/python),$(VENV)/bin/python,python3)
 VERILATOR ?= verilator
 YOSYS ?= yosys
 CC ?= cc
@@ -202,5 +203,18 @@ demo: $(SIMS) sw
 	$(PYTHON) tools/bench.py | sed -n '1,40p'
 	@echo; echo "one bug-museum case (lost upgrade) on the buggy 2-hart build:"
 	-./build/vsmp2-bug1 --model --max-cycles 4000000 build/sw/lost_upgrade.elf
+
+# long random soak with varied timing perturbation (fixed seeds)
+SOAK_SEEDS ?= 40
+.PHONY: soak reproduce
+soak: build/vsmp2 build/vsmp4 build/sw/stress.elf build/sw/atomics.elf
+	@fails=0; for s in $$(seq 1 $(SOAK_SEEDS)); do for n in 2 4; do 	  ./build/vsmp$$n --model --seed $$s --stall-pct $$((s%40)) --jitter $$((s%16)) build/sw/stress.elf >/dev/null 2>&1 	    || { echo "FAIL stress n=$$n seed=$$s"; fails=1; }; done; done; 	  [ $$fails -eq 0 ] && echo "soak: $(SOAK_SEEDS) seeds x {2,4} harts, perturbed: all pass"
+
+# reproduce one run with a full trace, e.g. make reproduce SEED=7 N=4 PROG=stress
+SEED ?= 1
+N ?= 4
+PROG ?= stress
+reproduce: build/vsmp$(N) build/sw/$(PROG).elf
+	./build/vsmp$(N) --model --seed $(SEED) --stall-pct 20 --jitter 8 --trace build/trace.txt --stats build/sw/$(PROG).elf
 
 test: lint loopcheck iss-test mc system

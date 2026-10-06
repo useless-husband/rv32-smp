@@ -23,6 +23,12 @@ def test_random_stress(n, seed):
     assert r.returncode == 0, f"seed {seed}, {n} harts:\n{r.stderr[-2000:]}"
 
 
+@pytest.mark.parametrize("n", [2, 4])
+def test_cross_core_self_modifying_code(n):
+    r = run(vsmp(n), BUILD / "sw" / "smc.elf", "--model")
+    assert r.returncode == 0, f"cross-core fence.i failed on {n} harts:\n{r.stderr[-2000:]}"
+
+
 def test_false_sharing_fix_is_faster():
     r = run(vsmp(4), BUILD / "sw" / "false_sharing.elf", "--json", str(BUILD / "fs.json"))
     assert r.returncode == 0, r.stderr[-2000:]

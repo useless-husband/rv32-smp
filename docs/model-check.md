@@ -3,9 +3,9 @@
 | caches | addresses | states (after symmetry reduction) | transitions | depth | time | result |
 |---:|---:|---:|---:|---:|---:|---|
 | 2 | 1 | 324 | 1152 | 22 | 0.00 s | all properties hold |
-| 2 | 2 | 16155 | 66436 | 30 | 0.02 s | all properties hold |
-| 3 | 1 | 3343 | 14372 | 34 | 0.01 s | all properties hold |
-| 3 | 2 | 500087 | 2621821 | 53 | 1.63 s | all properties hold |
+| 2 | 2 | 16155 | 66436 | 30 | 0.01 s | all properties hold |
+| 3 | 1 | 3343 | 14372 | 34 | 0.00 s | all properties hold |
+| 3 | 2 | 500087 | 2621821 | 53 | 1.69 s | all properties hold |
 
 ## Bug variants: shortest counterexamples
 

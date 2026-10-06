@@ -32,4 +32,3 @@ false sharing, 4 harts, 20000 increments each:
   speed-up from the fix: 2.99x
 ```
 
-

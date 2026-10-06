@@ -163,7 +163,18 @@ mc: build/mc
 	@mkdir -p build/museum
 	./build/mc --all | tee build/mc.md
 
+# fetch the litmus suite (reference results included) into the gitignored data/
+.PHONY: litmus-fetch litmus
+litmus-fetch:
+	@test -f data/litmus/model-results/flat.logs || \
+	  { mkdir -p data && rm -rf data/litmus && \
+	    git clone -q --depth 1 https://github.com/litmus-tests/litmus-tests-riscv data/litmus && \
+	    echo "fetched litmus-tests-riscv into data/litmus"; }
+
+litmus: build/vsmp4 build/sw/litmus.elf litmus-fetch
+	./build/vsmp4 --seed 7 --stall-pct 20 --jitter 8 --max-cycles 80000000 build/sw/litmus.elf | tee build/litmus.json
+
 system: $(SIMS) $(BUG_SIMS) rvtests sw build/rvsim
-	$(PYTHON) -m pytest -q -n0 tests/system 2>/dev/null || $(PYTHON) -m pytest -q tests/system
+	$(PYTHON) -m pytest -q tests/system
 
 test: lint loopcheck iss-test mc system

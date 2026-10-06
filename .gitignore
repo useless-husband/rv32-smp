@@ -9,3 +9,4 @@ results.xml
 obj_dir/
 .DS_Store
 data/
+.venv/

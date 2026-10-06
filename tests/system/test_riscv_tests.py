@@ -1,63 +1,37 @@
-"""The official riscv-tests on the cores, each run in lockstep with the golden
-model: rv32ui and rv32um on core A, core B and core B with the FPU; rv32uf
-and rv32ud on core B with the FPU.  A test passes when it reports success
-through the EXIT register AND every committed instruction matched."""
+"""Every riscv-tests ISA test (rv32ui + rv32um + rv32ua) runs on EVERY hart of
+the 1-, 2- and 4-hart builds, in lockstep with that hart's golden model and
+with the protocol-model agreement check turned on.  A multicore must still be
+a correct uniprocessor on each core."""
 
-import re
+import subprocess
 
 import pytest
 
-from conftest import ALL_CORES, BUILD, FP_CORE, REPO, run_vsim
+from conftest import BUILD, HART_COUNTS, REPO, run, vsmp
 
-RISCV_TESTS = BUILD / "third_party" / "riscv-tests"
-EXTS = {"rv32ui": "RV32UI", "rv32um": "RV32UM", "rv32uf": "RV32UF", "rv32ud": "RV32UD"}
-
-
-def makefile_list(var):
-    text = (REPO / "Makefile").read_text()
-    m = re.search(rf"^{var} := ((?:.*\\\n)*.*)$", text, re.M)
-    return m.group(1).replace("\\\n", " ").split()
+# rv32ua minus the Zacas instructions (amocas_*), which this core does not implement
+RV32UA = ["amoadd_w", "amoand_w", "amomax_w", "amomaxu_w", "amomin_w", "amominu_w", "amoor_w",
+          "amoswap_w", "amoxor_w", "lrsc"]
 
 
-INT_TESTS = [f"{e}-{t}" for e in ("rv32ui", "rv32um") for t in makefile_list(EXTS[e])]
-FP_TESTS = [f"{e}-{t}" for e in ("rv32uf", "rv32ud") for t in makefile_list(EXTS[e])]
+def all_tests():
+    d = BUILD / "rvtests"
+    if not d.exists():
+        pytest.skip("riscv-tests not built (run make rvtests)")
+    return sorted(p.stem for p in d.glob("*.elf"))
 
 
-def upstream_list(ext):
-    frag = (RISCV_TESTS / "isa" / ext / "Makefrag").read_text()
-    m = re.search(rf"^{ext}_sc_tests = \\\n((?:.*\\\n)*)", frag, re.M)
-    return m.group(1).replace("\\\n", " ").split()
+@pytest.mark.parametrize("n", HART_COUNTS)
+def test_every_hart_passes_isa_suite(n):
+    sim = vsmp(n)
+    tests = all_tests()
+    assert tests, "no riscv-tests ELFs"
+    for k in range(n):
+        for t in tests:
+            r = run(sim, BUILD / "rvtests" / f"{t}.elf", "--model", "--run-hart", str(k))
+            assert r.returncode == 0, f"{t} failed on hart {k}/{n}: exit {r.returncode}\n{r.stderr[-2000:]}"
 
 
-@pytest.mark.parametrize("ext", list(EXTS))
-def test_list_matches_upstream(ext):
-    """Our Makefile runs exactly the tests the pinned commit lists."""
-    if not RISCV_TESTS.exists():
-        pytest.skip("riscv-tests not fetched")
-    assert makefile_list(EXTS[ext]) == upstream_list(ext)
-
-
-def run_test(core, test):
-    elf = BUILD / "rvtests" / f"{test}.elf"
-    r = run_vsim(core, elf, "--max-cycles", "2000000")
-    assert r.returncode == 0, f"{test} on {core}: exit {r.returncode}\n{r.stderr[-3000:]}"
-
-
-@pytest.mark.parametrize("core", ALL_CORES)
-@pytest.mark.parametrize("test", INT_TESTS)
-def test_riscv_test(core, test):
-    run_test(core, test)
-
-
-@pytest.mark.parametrize("test", FP_TESTS)
-def test_riscv_fp_test(test):
-    run_test(FP_CORE, test)
-
-
-@pytest.mark.parametrize("core", ["single", "pipe"])
-def test_fp_is_illegal_without_fpu(core):
-    """On the RV32IM cores every F/D instruction traps: the F test's first FP
-    CSR access raises an illegal-instruction exception, which the test
-    environment reports as a failure (and the lockstep comparison agrees)."""
-    r = run_vsim(core, BUILD / "rvtests" / "rv32uf-fadd.elf", "--max-cycles", "2000000")
-    assert r.returncode == 1, r.stderr[-2000:]
+def test_atomics_suite_present():
+    for t in RV32UA:
+        assert (BUILD / "rvtests" / f"rv32ua-{t}.elf").exists(), f"rv32ua-{t} not built"

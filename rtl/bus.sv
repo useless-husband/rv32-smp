@@ -214,6 +214,6 @@ module bus #(
     assign shared = shr;
 
     assign trace = {(state == B_RESP), sup_v, shr, (state == B_IDLE && found),
-                    4'((state == B_IDLE) ? win : owner), (state == B_IDLE) ? w_cmd : cmd, 21'd0,
+                    (state == B_IDLE) ? 4'(win) : 4'(owner), (state == B_IDLE) ? w_cmd : cmd, 21'd0,
                     (state == B_IDLE) ? w_addr : addr};
 endmodule

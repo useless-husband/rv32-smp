@@ -35,7 +35,7 @@ def area(path):
 
 def depth(path):
     txt = Path(path).read_text()
-    m = re.search(r"longest topological path.*?(\d+)", txt, re.S)
+    m = re.search(r"Longest topological path in \S+ \(length=(\d+)\)", txt)
     return int(m.group(1)) if m else None
 
 
@@ -65,12 +65,18 @@ def main():
     a2 = rows[2][0]
     out.append("")
     dl = a2["LUT"] - a1["LUT"]
-    out.append(f"Going from 1 to 2 harts adds {dl:,} LUTs: a second core and L1 (the bulk) plus the snoop "
-               "logic and the wider bus arbiter.  Block RAM scales with the caches (I-cache + D-cache per hart). "
-               "The design fits the XC7S50 through 4 harts.")
-    for n in (1, 2, 4):
-        if rows[n][0]["LUT"] > CAP["LUT"] or rows[n][0]["FF"] > CAP["FF"]:
-            out.append(f"\n**{n} harts does not fit the XC7S50.**")
+    out.append(f"Each hart is one pipeline, its I-cache and MESI L1, and its share of the snoop logic; a hart "
+               f"adds about {dl:,} LUTs and {a2['FF'] - a1['FF']:,} flip-flops.  Block RAM scales with the caches "
+               "(one I-cache + one D-cache per hart).")
+    fits = [n for n in (1, 2, 4) if rows[n][0]["LUT"] <= CAP["LUT"] and rows[n][0]["FF"] <= CAP["FF"]]
+    big = [n for n in (1, 2, 4) if n not in fits]
+    if fits:
+        out.append(f"\n1 and 2 harts fit the XC7S50 (the largest Spartan-7).  " if fits == [1, 2] else "")
+    if big:
+        out.append(f"**{', '.join(map(str, big))} harts exceed the XC7S50's {CAP['LUT']:,} LUTs** "
+                   "(43k for 4 harts): a 4-hart build needs a larger part (e.g. an Artix-7 XC7A100T, "
+                   "63,400 LUTs, or a mid-size UltraScale).  Everything here is simulation and a Yosys "
+                   "estimate; no board.")
     (REPO / "synth" / "report.md").write_text("\n".join(out) + "\n")
     print("\n".join(out))
     return 0

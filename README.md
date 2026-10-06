@@ -68,7 +68,7 @@ minutes.
 | Explicit-state model check of the exact protocol, 2–3 caches × 1–2 addresses: single-writer/multiple-reader, data-value and deadlock-freedom | `make mc` | all properties hold; largest 3 caches × 2 addresses = **500,087 states** in 1.6 s |
 | Each bug variant has a shortest counterexample | `make mc` | 5 / 5 found |
 | Official riscv-tests (rv32ui + rv32um + rv32ua) on **every hart** of the 1-, 2- and 4-hart builds, in lockstep with that hart's golden model and with the RTL↔model agreement check on | `pytest tests/system/test_riscv_tests.py` | 60 tests × (1+2+4) harts = **420 / 420 pass** |
-| Atomic-counter stress (6 lock/counter kinds) on 1/2/4 harts, three checkers | `pytest -k coherence` | pass; no lost update |
+| Atomic-counter stress (6 lock/counter kinds) on 1/2/4 harts, three checkers | `pytest -k coherence` | pass; no lost update; cross-core self-modifying code (`fence.i`) also checked |
 | Random multi-core stress, fixed seeds, timing perturbed, golden memory checker + model agreement | `pytest -k stress` | pass (seeds 1–8 × 2/4 harts) |
 | Litmus tests (MP, SB, LB, 2+2W, IRIW, fence and AMO variants), 3,000 runs each, every observed outcome checked against the reference RVWMO model shipped with the suite | `make litmus` | **0 relaxed outcomes** — sequentially consistent, stronger than RVWMO; every outcome allowed |
 | Bug museum: each bug reproduced in the RTL by a directed program, and passing on the correct build | `pytest -k museum` | 5 / 5 caught, 5 / 5 pass when correct |

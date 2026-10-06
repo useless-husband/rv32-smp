@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Everything comes from Ubuntu's own packages: verilator (5.020 on 24.04),
+# yosys (0.33).  The RISC-V programs are built with LLVM 23 from apt.llvm.org
+# (Apple's clang on the dev machine has no RISC-V target either; LLVM 23 is
+# what the numbers were measured with).  The RTL keeps to a conservative
+# SystemVerilog subset (no packages, interfaces, multi-dimensional packed
+# arrays or casts to parameter widths), so these older versions accept it.
+# riscv-tests and the litmus suite are fetched by the Makefile at pinned/HEAD
+# refs into the gitignored build/ and data/ directories.
+
+jobs:
+  lint-and-model:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install HDL tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends verilator yosys
+          verilator --version; yosys --version
+      - name: Verilator lint (-Wall, 1/2/4 harts and every bug variant)
+        run: make lint
+      - name: Yosys combinational-loop / multiple-driver check
+        run: make loopcheck
+      - name: Explicit-state model check of the protocol and every bug
+        run: |
+          make mc
+          cat build/mc.md
+
+  core-correctness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Verilator and the RISC-V cross compiler (LLVM 23)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends verilator
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-23 main" | sudo tee /etc/apt/sources.list.d/llvm-23.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-23 lld-23
+          echo "CLANG=clang-23" >> "$GITHUB_ENV"
+          echo "LLD=ld.lld-23" >> "$GITHUB_ENV"
+      - run: python -m pip install pytest
+      - name: Build model, simulators (1/2/4 harts), riscv-tests and programs
+        run: make -j4 build/rvsim build/vsmp1 build/vsmp2 build/vsmp4 rvtests sw CLANG=$CLANG LLD=$LLD
+      - name: riscv-tests on the golden model
+        run: make iss-test CLANG=$CLANG LLD=$LLD
+      - name: riscv-tests on every hart + atomics + random stress (3 checkers)
+        run: python -m pytest -q tests/system/test_riscv_tests.py tests/system/test_coherence.py
+
+  museum-and-litmus:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Verilator and the RISC-V cross compiler (LLVM 23)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends verilator
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-23 main" | sudo tee /etc/apt/sources.list.d/llvm-23.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-23 lld-23
+          echo "CLANG=clang-23" >> "$GITHUB_ENV"
+          echo "LLD=ld.lld-23" >> "$GITHUB_ENV"
+      - run: python -m pip install pytest
+      - name: Build the correct and buggy simulators and the model checker
+        run: make -j4 build/mc build/vsmp2 build/vsmp4 $(for b in 1 2 3 4 5; do echo build/vsmp2-bug$b; done) sw CLANG=$CLANG LLD=$LLD
+      - name: Fetch the litmus suite (reference RVWMO outcomes)
+        run: make litmus-fetch
+      - name: Bug museum, model-checker counterexamples and litmus tests
+        run: python -m pytest -q tests/system/test_museum.py tests/system/test_model_check.py tests/system/test_litmus.py

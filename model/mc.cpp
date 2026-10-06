@@ -64,13 +64,13 @@ struct Codec {
         for (int c = 0; c < k.n; c++) {
             int pc = p[(size_t)c];
             for (int a = 0; a < k.a; a++) t.line[pc][q[(size_t)a]] = s.line[c][a];
-            t.pend[pc] = s.pend[c]; t.pa[pc] = (uint8_t)q[s.pa[c]]; t.pop[pc] = s.pop[c]; t.pcmd[pc] = s.pcmd[c];
-            t.wb[pc] = s.wb[c]; t.wa[pc] = (uint8_t)q[s.wa[c]]; t.wf[pc] = s.wf[c];
-            t.resv[pc] = s.resv[c]; t.ra[pc] = (uint8_t)q[s.ra[c]]; t.intact[pc] = s.intact[c]; t.young[pc] = s.young[c];
+            t.pend[pc] = s.pend[c]; t.pa[pc] = (uint16_t)q[s.pa[c]]; t.pop[pc] = s.pop[c]; t.pcmd[pc] = s.pcmd[c];
+            t.wb[pc] = s.wb[c]; t.wa[pc] = (uint16_t)q[s.wa[c]]; t.wf[pc] = s.wf[c];
+            t.resv[pc] = s.resv[c]; t.ra[pc] = (uint16_t)q[s.ra[c]]; t.intact[pc] = s.intact[c]; t.young[pc] = s.young[c];
         }
         for (int a = 0; a < k.a; a++) t.memf[q[(size_t)a]] = s.memf[a];
         t.owner = (uint8_t)p[s.owner];
-        t.ba = (uint8_t)q[s.ba];
+        t.ba = (uint16_t)q[s.ba];
         t.need = 0;
         for (int c = 0; c < k.n; c++)
             if ((s.need >> c) & 1) t.need |= (uint8_t)(1u << p[(size_t)c]);
@@ -105,15 +105,15 @@ struct Codec {
                 s.line[c][a].st = (uint8_t)get(x, p, 2);
                 s.line[c][a].fresh = (uint8_t)get(x, p, 1);
             }
-            s.pend[c] = (uint8_t)get(x, p, 1); s.pa[c] = (uint8_t)get(x, p, 1); s.pop[c] = (uint8_t)get(x, p, 3);
+            s.pend[c] = (uint8_t)get(x, p, 1); s.pa[c] = (uint16_t)get(x, p, 1); s.pop[c] = (uint8_t)get(x, p, 3);
             s.pcmd[c] = (uint8_t)get(x, p, 2);
-            s.wb[c] = (uint8_t)get(x, p, 1); s.wa[c] = (uint8_t)get(x, p, 1); s.wf[c] = (uint8_t)get(x, p, 1);
-            s.resv[c] = (uint8_t)get(x, p, 1); s.ra[c] = (uint8_t)get(x, p, 1); s.intact[c] = (uint8_t)get(x, p, 1);
+            s.wb[c] = (uint8_t)get(x, p, 1); s.wa[c] = (uint16_t)get(x, p, 1); s.wf[c] = (uint8_t)get(x, p, 1);
+            s.resv[c] = (uint8_t)get(x, p, 1); s.ra[c] = (uint16_t)get(x, p, 1); s.intact[c] = (uint8_t)get(x, p, 1);
             s.young[c] = (uint8_t)get(x, p, 1);
         }
         for (int a = 0; a < k.a; a++) s.memf[a] = (uint8_t)get(x, p, 1);
         s.busy = (uint8_t)get(x, p, 1); s.owner = (uint8_t)get(x, p, 2); s.bcmd = (uint8_t)get(x, p, 2);
-        s.ba = (uint8_t)get(x, p, 1); s.need = (uint8_t)get(x, p, 3);
+        s.ba = (uint16_t)get(x, p, 1); s.need = (uint8_t)get(x, p, 3);
         s.sup = (uint8_t)get(x, p, 1); s.supf = (uint8_t)get(x, p, 1); s.shared = (uint8_t)get(x, p, 1);
         return s;
     }

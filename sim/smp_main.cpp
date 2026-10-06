@@ -199,6 +199,8 @@ int main(int argc, char **argv)
     std::vector<uint64_t> retired((size_t)N, 0);
     std::vector<uint64_t> events((size_t)(N * RV_HPM_COUNT), 0);
     uint64_t bus_cmds[8] = {0}, bus_busy = 0, bus_supplied = 0;
+    // how often the races the protocol must resolve actually happened
+    uint64_t race_upg = 0, race_wb = 0, race_resv = 0, defer_cycles = 0;
     std::string console;
     bool exited = false;
     uint32_t exit_value = 0;
@@ -233,8 +235,14 @@ int main(int argc, char **argv)
             status = 6;
             break;
         }
-        for (int h = 0; h < N; h++)
-            if (tr[(size_t)h].perf) H.q[(size_t)h].push_back(tr[(size_t)h]);
+        for (int h = 0; h < N; h++) {
+            const L1Trace &t = tr[(size_t)h];
+            if (t.perf) H.q[(size_t)h].push_back(t);
+            if (t.snp && t.snp_upg_conv) race_upg++;
+            if (t.snp && t.supply_wb) race_wb++;
+            if (t.snp && t.snp_resv_clr) race_resv++;
+            if (t.defer) defer_cycles++;
+        }
 
         // 2. coherence events -> protocol model, log
         if (opt.model || coh) {
@@ -357,6 +365,9 @@ int main(int argc, char **argv)
         std::fprintf(stderr, "  memory check: %" PRIu64 " accesses, %" PRIu64 " writes, SC %" PRIu64 " ok / %" PRIu64
                              " failed\n",
                      mc.checked, mc.writes, mc.sc_ok, mc.sc_fail);
+        std::fprintf(stderr, "  races resolved: upgrade->BusRdX %" PRIu64 ", write-back buffer supplied %" PRIu64
+                             ", reservation cleared by snoop %" PRIu64 ", lock-out deferral cycles %" PRIu64 "\n",
+                     race_upg, race_wb, race_resv, defer_cycles);
         if (opt.model) std::fprintf(stderr, "  model agreement: %" PRIu64 " coherence events checked\n", agree.checked);
     }
     if (!opt.json.empty()) {
@@ -372,6 +383,9 @@ int main(int argc, char **argv)
             std::fprintf(f, ", \"memcheck\": {\"accesses\": %" PRIu64 ", \"writes\": %" PRIu64 ", \"sc_ok\": %" PRIu64
                             ", \"sc_fail\": %" PRIu64 "}, \"model_events\": %" PRIu64,
                          mc.checked, mc.writes, mc.sc_ok, mc.sc_fail, agree.checked);
+            std::fprintf(f, ", \"races\": {\"upgrade_to_rdx\": %" PRIu64 ", \"wb_buffer_supplied\": %" PRIu64
+                            ", \"resv_cleared\": %" PRIu64 ", \"defer_cycles\": %" PRIu64 "}",
+                         race_upg, race_wb, race_resv, defer_cycles);
             std::fprintf(f, ", \"per_hart\": [");
             for (int h = 0; h < N; h++) {
                 std::fprintf(f, "%s{\"instret\": %" PRIu64, h ? ", " : "", retired[(size_t)h]);

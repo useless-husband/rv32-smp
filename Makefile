@@ -60,13 +60,13 @@ build/sw/%.elf: sw/demo/%.c $(RT_OBJ) sw/runtime/link.ld sw/runtime/smp.h
 build/sw/%.elf: tests/programs/%.c $(RT_OBJ) sw/runtime/link.ld sw/runtime/smp.h
 	$(CLANG) $(RVCFLAGS) -c -o build/sw/$*.o $<
 	$(LLD) $(RVLDFLAGS) -o $@ $(RT_OBJ) build/sw/$*.o
-build/sw/%.elf: tests/museum/%.S $(RT_OBJ) sw/runtime/link.ld
+build/sw/%.elf: tests/museum/%.c $(RT_OBJ) sw/runtime/link.ld sw/runtime/smp.h
 	$(CLANG) $(RVCFLAGS) -c -o build/sw/$*.o $<
 	$(LLD) $(RVLDFLAGS) -o $@ $(RT_OBJ) build/sw/$*.o
 
 PROGRAMS := $(patsubst sw/demo/%.c,build/sw/%.elf,$(wildcard sw/demo/*.c)) \
             $(patsubst tests/programs/%.c,build/sw/%.elf,$(wildcard tests/programs/*.c)) \
-            $(patsubst tests/museum/%.S,build/sw/%.elf,$(wildcard tests/museum/*.S))
+            $(patsubst tests/museum/%.c,build/sw/%.elf,$(wildcard tests/museum/*.c))
 sw: $(PROGRAMS)
 
 clean:

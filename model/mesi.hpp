@@ -83,11 +83,15 @@ template <int MA> struct State {
     Line line[MAXN][MA];
     uint8_t memf[MA];
     // per cache
-    uint8_t pend[MAXN], pa[MAXN], pop[MAXN], pcmd[MAXN];
-    uint8_t wb[MAXN], wa[MAXN], wf[MAXN];
-    uint8_t resv[MAXN], ra[MAXN], intact[MAXN], young[MAXN];
+    uint8_t pend[MAXN], pop[MAXN], pcmd[MAXN];
+    uint16_t pa[MAXN];                       // (line indices are 16 bits: the agreement check maps many lines)
+    uint8_t wb[MAXN], wf[MAXN];
+    uint16_t wa[MAXN];
+    uint8_t resv[MAXN], intact[MAXN], young[MAXN];
+    uint16_t ra[MAXN];
     // bus
-    uint8_t busy, owner, bcmd, ba, need, sup, supf, shared;
+    uint8_t busy, owner, bcmd, need, sup, supf, shared;
+    uint16_t ba;
     State() { std::memset(this, 0, sizeof *this); for (int x = 0; x < MA; x++) memf[x] = 1; }
 };
 
@@ -151,7 +155,7 @@ template <int MA> int perform(State<MA> &s, const Cfg &k, int c, int a, int op, 
     switch (op) {
     case ST: case AMO: write_line(s, k, c, a); break;
     case LR:
-        s.resv[c] = 1; s.ra[c] = (uint8_t)a; s.intact[c] = 1; s.young[c] = 1;
+        s.resv[c] = 1; s.ra[c] = (uint16_t)a; s.intact[c] = 1; s.young[c] = 1;
         break;
     case SC: {
         bool ok = s.resv[c] && s.ra[c] == a;
@@ -196,14 +200,14 @@ template <int MA> int access(State<MA> &s, const Cfg &k, int c, int a, int op, i
         return v ? v : check_line(s, k, a);
     }
     s.young[c] = 0;   // the core waits for the cache: no lock-out
-    s.pend[c] = 1; s.pa[c] = (uint8_t)a; s.pop[c] = (uint8_t)op;
+    s.pend[c] = 1; s.pa[c] = (uint16_t)a; s.pop[c] = (uint8_t)op;
     if (s.line[c][a].st == S) {
         s.pcmd[c] = UPGR;
     } else {
         s.pcmd[c] = op == LD ? RD : RDX;
         if (victim >= 0) {
             Line &l = s.line[c][victim];
-            if (l.st == M) { s.wb[c] = 1; s.wa[c] = (uint8_t)victim; s.wf[c] = l.fresh; }
+            if (l.st == M) { s.wb[c] = 1; s.wa[c] = (uint16_t)victim; s.wf[c] = l.fresh; }
             l.st = I;
             if (s.resv[c] && s.ra[c] == victim) { s.resv[c] = 0; s.intact[c] = 0; }
             int v = check_line(s, k, victim);
@@ -490,8 +494,13 @@ struct Agreement {
                         return fail(err, "hart %d wrote back %08x; the model has no such write-back%s", h, bt.addr);
                     grant_wb(*s, k, h);
                 } else {
-                    if (!can_grant(*s, h) || s->pa[h] != a || s->pcmd[h] != bt.cmd)
-                        return fail(err, "hart %d was granted %08x; the model has a different request%s", h, bt.addr);
+                    if (!can_grant(*s, h) || s->pa[h] != a || s->pcmd[h] != bt.cmd) {
+                        char why[120];
+                        std::snprintf(why, sizeof why, " (bus %s, request %s %s for model line %d, granted %s line %d)",
+                                      s->busy ? "busy" : "idle", s->pend[h] ? "pending" : "none", cmd_str(s->pcmd[h]),
+                                      s->pa[h], cmd_str(bt.cmd), a);
+                        return fail(err, "hart %d was granted %08x; the model has a different request%s", h, bt.addr, why);
+                    }
                     grant(*s, k, h);
                 }
             }

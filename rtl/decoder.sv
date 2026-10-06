@@ -1,15 +1,17 @@
-// Instruction decoder for RV32IM + Zicsr + Zifencei (machine mode), plus F
-// and D when FPU = 1 (with FPU = 0 their opcodes are illegal as before).  Purely combinational; shared by both cores.  An
-// illegal encoding clears every side-effect output (no register write, no
-// memory access) and sets `illegal`.  Whether a CSR number exists is decided
-// by csr_file, not here.  Two F/D checks depend on CSR state and are made in
-// EX instead: mstatus.FS must be on, and a dynamic rounding mode (funct3 =
-// 111) needs a valid frm.
+// Instruction decoder for RV32IMA + Zicsr + Zifencei (machine mode).
+// Purely combinational.  An illegal encoding clears every side-effect output
+// (no register write, no memory access) and sets `illegal`.  Whether a CSR
+// number exists is decided by csr_file, not here.
+//
+// The A extension (opcode AMO, word size only): LR.W, SC.W and the nine
+// AMOs.  They are decoded as loads (they write rd from memory, so the
+// load-use interlock applies) with is_atomic set and amo_op = funct5; the
+// address is rs1 itself (immediate 0).  The aq/rl bits are accepted and
+// need no action: this core performs every memory access in program order
+// and in one place (see docs/DESIGN.md, memory model).
 `include "rv_defs.svh"
 
-module decoder #(
-    parameter bit FPU = 1'b0
-) (
+module decoder (
     input  logic [31:0] insn,
     output logic [3:0]  alu_op,
     output logic [1:0]  a_sel,
@@ -28,6 +30,8 @@ module decoder #(
     output logic        is_jalr,
     output logic        is_load,
     output logic        is_store,
+    output logic        is_atomic,  // A extension (is_load is also set)
+    output logic [4:0]  amo_op,     // funct5 of an A instruction (AMO_* in rv_defs.svh)
     output logic        is_mdu,     // M extension
     output logic        is_div,     // DIV/DIVU/REM/REMU
     output logic        is_csr,
@@ -36,25 +40,11 @@ module decoder #(
     output logic        is_ebreak,
     output logic        is_mret,
     output logic        is_fencei,
-    output logic        illegal,
-    // F and D (all zero when FPU = 0)
-    output logic [4:0]  rs3,
-    output logic        is_fp,      // any F/D instruction, including FLW/FLD/FSW/FSD
-    output logic        fp_unit,    // executes in the FPU
-    output logic [4:0]  fp_op,      // FOP_*
-    output logic        fp_dbl,     // double format (for FLD/FSD: an 8-byte access)
-    output logic        fp_rm_dyn,  // rounding mode comes from frm
-    output logic        uses_frs1,
-    output logic        uses_frs2,
-    output logic        uses_frs3,
-    output logic        frd_we      // writes floating-point register rd
+    output logic        illegal
 );
     logic [6:0] opcode, funct7;
     logic [31:0] imm_i, imm_s, imm_b, imm_u, imm_j;
     logic writes, legal;
-    logic fwrites, rm_used;
-    logic fp_hit, fp_legal, fp_unit_i, fp_fwrites, fp_frs1, fp_frs2, fp_frs3, fp_rm_used;
-    logic fp_load, fp_store, fp_xrs1, fp_xwrites;
 
     assign opcode = insn[6:0];
     assign funct3 = insn[14:12];
@@ -62,32 +52,7 @@ module decoder #(
     assign rd     = insn[11:7];
     assign rs1    = insn[19:15];
     assign rs2    = insn[24:20];
-    assign rs3    = insn[31:27];
-
-    generate
-        if (FPU) begin : g_fp
-            fp_decoder u_fp (
-                .insn(insn), .hit(fp_hit), .legal(fp_legal), .fp_unit(fp_unit_i), .fp_op(fp_op),
-                .fp_dbl(fp_dbl), .rm_used(fp_rm_used), .fwrites(fp_fwrites), .uses_frs1(fp_frs1),
-                .uses_frs2(fp_frs2), .uses_frs3(fp_frs3), .is_load(fp_load), .is_store(fp_store),
-                .uses_xrs1(fp_xrs1), .xwrites(fp_xwrites));
-        end else begin : g_no_fp
-            assign fp_hit = 1'b0;
-            assign fp_legal = 1'b0;
-            assign fp_unit_i = 1'b0;
-            assign fp_op = 5'd0;
-            assign fp_dbl = 1'b0;
-            assign fp_rm_used = 1'b0;
-            assign fp_fwrites = 1'b0;
-            assign fp_frs1 = 1'b0;
-            assign fp_frs2 = 1'b0;
-            assign fp_frs3 = 1'b0;
-            assign fp_load = 1'b0;
-            assign fp_store = 1'b0;
-            assign fp_xrs1 = 1'b0;
-            assign fp_xwrites = 1'b0;
-        end
-    endgenerate
+    assign amo_op = insn[31:27];
 
     assign imm_i = {{20{insn[31]}}, insn[31:20]};
     assign imm_s = {{20{insn[31]}}, insn[31:25], insn[11:7]};
@@ -115,14 +80,8 @@ module decoder #(
         is_ebreak = 1'b0;
         is_mret = 1'b0;
         is_fencei = 1'b0;
+        is_atomic = 1'b0;
         legal = 1'b0;
-        is_fp = 1'b0;
-        fp_unit = 1'b0;
-        fwrites = 1'b0;
-        uses_frs1 = 1'b0;
-        uses_frs2 = 1'b0;
-        uses_frs3 = 1'b0;
-        rm_used = 1'b0;
 
         case (opcode)
             7'b0110111: begin // LUI
@@ -186,7 +145,16 @@ module decoder #(
                     endcase
                 end
             end
-            7'b0001111: begin // FENCE (no-op on one hart), FENCE.I
+            7'b0101111: begin // A extension, word size
+                is_atomic = 1'b1; is_load = 1'b1; writes = 1'b1; wb_sel = `WB_MEM;
+                uses_rs1 = 1'b1; uses_rs2 = (amo_op != `AMO_LR); imm = 32'd0;
+                legal = (funct3 == 3'b010) && (amo_op == `AMO_LR ? rs2 == 5'd0 :
+                         amo_op == `AMO_SC || amo_op == `AMO_SWAP || amo_op == `AMO_ADD ||
+                         amo_op == `AMO_XOR || amo_op == `AMO_AND || amo_op == `AMO_OR ||
+                         amo_op == `AMO_MIN || amo_op == `AMO_MAX || amo_op == `AMO_MINU ||
+                         amo_op == `AMO_MAXU);
+            end
+            7'b0001111: begin // FENCE (no-op: accesses are already performed in order), FENCE.I
                 legal = (funct3 == 3'b000) || (funct3 == 3'b001);
                 is_fencei = (funct3 == 3'b001);
             end
@@ -204,41 +172,17 @@ module decoder #(
             default: legal = 1'b0;
         endcase
 
-        // F and D: decoded by fp_decoder (below), which exists only when FPU = 1
-        if (FPU && fp_hit) begin
-            legal = fp_legal;
-            is_fp = 1'b1;
-            fp_unit = fp_unit_i;
-            fwrites = fp_fwrites;
-            uses_frs1 = fp_frs1;
-            uses_frs2 = fp_frs2;
-            uses_frs3 = fp_frs3;
-            rm_used = fp_rm_used;
-            is_load = fp_load;
-            is_store = fp_store;
-            uses_rs1 = fp_xrs1;
-            writes = fp_xwrites;
-            if (fp_store) imm = imm_s;
-            if (fp_load) wb_sel = `WB_MEM;
-            if (fp_xwrites) wb_sel = `WB_FPU;
-        end
-
         if (insn[1:0] != 2'b11)
             legal = 1'b0;
         illegal = !legal;
         if (!legal) begin
             writes = 1'b0;
             is_branch = 1'b0; is_jal = 1'b0; is_jalr = 1'b0;
-            is_load = 1'b0; is_store = 1'b0; is_mdu = 1'b0; is_csr = 1'b0;
+            is_load = 1'b0; is_store = 1'b0; is_atomic = 1'b0; is_mdu = 1'b0; is_csr = 1'b0;
             is_ecall = 1'b0; is_ebreak = 1'b0; is_mret = 1'b0; is_fencei = 1'b0;
             uses_rs1 = 1'b0; uses_rs2 = 1'b0;
-            is_fp = 1'b0; fp_unit = 1'b0; fwrites = 1'b0; rm_used = 1'b0;
-            uses_frs1 = 1'b0; uses_frs2 = 1'b0; uses_frs3 = 1'b0;
         end
     end
-
-    assign frd_we = fwrites;
-    assign fp_rm_dyn = rm_used && (funct3 == 3'b111);
 
     assign rd_we = writes && (rd != 5'd0);
     assign is_div = is_mdu && funct3[2];

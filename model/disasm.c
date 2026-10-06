@@ -122,6 +122,16 @@ void rv_disasm(uint32_t pc, uint32_t in, char *b, size_t n)
                  f7 == 1 ? md[f3] : f7 == 0x20 ? (f3 == 0 ? "sub" : "sra") : oo[f3], R[rd], R[r1], R[r2]);
         return;
     case 0x0f: snprintf(b, n, f3 == 1 ? "fence.i" : "fence"); return;
+    case 0x2f: {
+        static const char *amo[32] = {"amoadd.w", "amoswap.w", "lr.w", "sc.w", "amoxor.w", 0, 0, 0, "amoor.w",
+                                      0, 0, 0, "amoand.w", 0, 0, 0, "amomin.w", 0, 0, 0, "amomax.w", 0, 0, 0,
+                                      "amominu.w", 0, 0, 0, "amomaxu.w", 0, 0, 0};
+        const char *m = amo[in >> 27];
+        if (!m || f3 != 2) break;
+        if ((in >> 27) == 2) snprintf(b, n, "%s %s, (%s)", m, R[rd], R[r1]);
+        else snprintf(b, n, "%s %s, %s, (%s)", m, R[rd], R[r2], R[r1]);
+        return;
+    }
     case 0x73:
         if (in == 0x00000073u) { snprintf(b, n, "ecall"); return; }
         if (in == 0x00100073u) { snprintf(b, n, "ebreak"); return; }

@@ -1,46 +1,61 @@
-// Core B: 5-stage pipelined RV32IM core (IF, ID, EX, MEM, WB) with full
-// forwarding, a one-cycle load-use stall, branch resolution in EX with a
-// BTB + 2-bit-counter predictor, an iterative divider, an I-cache and a
-// write-back D-cache sharing one memory bus.  See docs/DESIGN.md.
-//
-// FPU = 1 adds the F and D extensions: 32 64-bit f registers read in ID
-// with their own forwarding paths, a multi-cycle floating-point unit in EX
-// (fpu.sv; the instruction waits there, like a divide) and FLD/FSD as two
-// word accesses in MEM.  With FPU = 0 every F/D signal is constant and the
-// core is the RV32IM one.
+// One hart: the 5-stage pipelined RV32IMA core (IF, ID, EX, MEM, WB) with
+// full forwarding, a one-cycle load-use stall, branch resolution in EX with a
+// BTB + 2-bit-counter predictor, an iterative divider, an I-cache and a MESI
+// L1 data cache on the shared snooping bus.  The pipeline is the one of
+// rv32-pipeline (core B); what changed for the multicore is listed in
+// docs/DESIGN.md, section 2.
 //
 // Who may stall whom (each stage holds when a later one holds):
-//   MEM holds   : D-cache not ready, or FENCE.I still flushing the caches,
-//                 or the second word of an FLD/FSD is still to come
-//   EX holds    : MEM holds, or a divide or FPU operation is still running
-//   ID holds    : EX holds, or a load-use hazard, or a CSR instruction
-//                 waiting for EX/MEM/WB to drain
+//   MEM holds   : the L1 is not ready (miss, snoop being answered, bus busy),
+//                 or FENCE.I still invalidating the I-cache
+//   EX holds    : MEM holds, or a divide is still running
+//   ID holds    : EX holds, or a load-use hazard (atomics count as loads),
+//                 or a CSR instruction waiting for EX/MEM/WB to drain
 //   IF holds    : ID holds, or the I-cache misses (ID then gets a bubble)
 // Redirects (they discard every younger instruction):
 //   from EX  : the next PC differs from the predicted one (mispredicted
 //              branch/jump, trap, MRET)       -> IF and ID are flushed
-//   from MEM : FENCE.I after the caches are done -> IF, ID and EX flushed
+//   from MEM : FENCE.I after the I-cache is invalidated -> IF, ID, EX flushed
+//
+// Memory accesses (loads, stores, LR, SC, AMOs) are performed in MEM, one at
+// a time and in program order, and the L1 blocks until each one is done:
+// there is no store buffer.  That is why FENCE needs no action here.
 `include "rv_defs.svh"
 
-module core_pipe #(
+module core #(
+    parameter int  HARTID      = 0,
     parameter int  ICACHE_SETS = 256,   // 4 KiB direct mapped
     parameter int  DCACHE_SETS = 128,   // 4 KiB, 2 ways
     parameter int  BTB_ENTRIES = 128,
     parameter int  BHT_ENTRIES = 256,
     parameter int  RAS_DEPTH   = 8,
     parameter bit  BP_ENABLE   = 1'b1,
-    parameter bit  FPU         = 1'b0    // 1: RV32IMFD
+    parameter int  BUG         = 0,     // protocol variant of the L1 (`BUG_*)
+    parameter int  LOCKOUT     = 32     // LR lock-out window of the L1
 ) (
     input  logic         clk,
-    input  logic         rst,
-    // memory bus (line based, see mem_arbiter.sv)
-    output logic         bus_req,
-    output logic         bus_we,
-    output logic [31:0]  bus_addr,
-    output logic [127:0] bus_wdata,
-    output logic [15:0]  bus_wstrb,
-    input  logic         bus_ack,
+    input  logic         sys_rst,       // resets everything
+    input  logic         run,           // 0: the pipeline is held in reset (its caches still answer snoops)
+    input  logic         fetch_stall,   // simulation timing noise: no fetch this cycle (0 in synthesis)
+    // the L1 data cache on the bus (see bus.sv)
+    output logic         dbus_req,
+    output logic [2:0]   dbus_cmd,
+    output logic [31:0]  dbus_addr,
+    output logic [127:0] dbus_wdata,
+    output logic [15:0]  dbus_wstrb,
+    input  logic         dbus_ack,
+    output logic         ibus_req,
+    output logic [31:0]  ibus_addr,
+    input  logic         ibus_ack,
     input  logic [127:0] bus_rdata,
+    input  logic         bus_shared,
+    input  logic         snp_valid,
+    input  logic [2:0]   snp_cmd,
+    input  logic [31:0]  snp_addr,
+    output logic         snp_done,
+    output logic         snp_hit,
+    output logic         snp_supply,
+    output logic [127:0] snp_data,
     // commit port
     output logic         commit_valid,
     output logic [31:0]  commit_pc,
@@ -54,28 +69,13 @@ module core_pipe #(
     output logic [31:0]  commit_mem_addr,
     output logic [31:0]  commit_mem_wdata,
     output logic [3:0]   commit_mem_wmask,
-    // ... F/D part (constant zero when FPU = 0)
-    output logic         commit_frd_we,      // wrote f register commit_rd
-    output logic [63:0]  commit_frd_val,
-    output logic [4:0]   commit_fflags,      // exception flags raised
-    output logic         commit_mem_dbl,     // FSD: commit_mem_wdata_hi goes to commit_mem_addr + 4
-    output logic [31:0]  commit_mem_wdata_hi,
     output logic [`NUM_EVENTS-1:0] perf_events,
-    // pipeline-viewer probes (simulation only; unused in synthesis)
-    output logic [31:0]  dbg_f_pc,
-    output logic [15:0]  dbg_f_seq,
-    output logic         dbg_d_valid,
-    output logic [15:0]  dbg_d_seq,
-    output logic [31:0]  dbg_d_pc,
-    output logic [31:0]  dbg_d_insn,
-    output logic         dbg_e_valid,
-    output logic [15:0]  dbg_e_seq,
-    output logic         dbg_m_valid,
-    output logic [15:0]  dbg_m_seq,
-    output logic         dbg_w_valid,
-    output logic [15:0]  dbg_w_seq,
-    output logic [5:0]   dbg_why   // stall/flush reasons, see sim/pipeview.inc
+    output logic [255:0] trace      // L1 trace record for the harness (sim/trace.h)
 );
+    // the pipeline's reset; the caches use sys_rst
+    logic rst;
+    assign rst = sys_rst || !run;
+
     // ===================================================== control (global)
     logic m_stall, e_hold, e_busy, d_hold, d_hazard;
     logic e_fire, d_fire, f_fire, m_fire;
@@ -90,7 +90,7 @@ module core_pipe #(
 
     assign pc_f4 = pc_f + 32'd4;
     assign pred_next = bp_taken ? bp_target : pc_f4;
-    assign f_fire = ic_hit && !d_hold && !redirect_ex && !redirect_mem;
+    assign f_fire = ic_hit && !d_hold && !redirect_ex && !redirect_mem && !fetch_stall;
 
     logic [31:0] m_pc;
     always_comb begin
@@ -137,20 +137,17 @@ module core_pipe #(
     logic [2:0]  dc_wb_sel, dc_funct3;
     logic        dc_is_branch, dc_is_jal, dc_is_jalr, dc_is_load, dc_is_store, dc_is_mdu, dc_is_div;
     logic        dc_is_csr, dc_csr_writes, dc_is_ecall, dc_is_ebreak, dc_is_mret, dc_is_fencei, dc_illegal;
-    logic [4:0]  dc_rs3, dc_fp_op;
-    logic        dc_is_fp, dc_fp_unit, dc_fp_dbl, dc_fp_rm_dyn, dc_uses_frs1, dc_uses_frs2, dc_uses_frs3, dc_frd_we;
+    logic        dc_is_atomic;
+    logic [4:0]  dc_amo_op;
 
-    decoder #(.FPU(FPU)) u_dec (
+    decoder u_dec (
         .insn(d_insn), .alu_op(dc_alu_op), .a_sel(dc_a_sel), .b_imm(dc_b_imm), .imm(dc_imm),
         .rd(dc_rd), .rs1(dc_rs1), .rs2(dc_rs2), .uses_rs1(dc_uses_rs1), .uses_rs2(dc_uses_rs2),
         .rd_we(dc_rd_we), .wb_sel(dc_wb_sel), .funct3(dc_funct3), .is_branch(dc_is_branch),
         .is_jal(dc_is_jal), .is_jalr(dc_is_jalr), .is_load(dc_is_load), .is_store(dc_is_store),
-        .is_mdu(dc_is_mdu), .is_div(dc_is_div), .is_csr(dc_is_csr), .csr_writes(dc_csr_writes),
+        .is_atomic(dc_is_atomic), .amo_op(dc_amo_op), .is_mdu(dc_is_mdu), .is_div(dc_is_div), .is_csr(dc_is_csr), .csr_writes(dc_csr_writes),
         .is_ecall(dc_is_ecall), .is_ebreak(dc_is_ebreak), .is_mret(dc_is_mret),
-        .is_fencei(dc_is_fencei), .illegal(dc_illegal),
-        .rs3(dc_rs3), .is_fp(dc_is_fp), .fp_unit(dc_fp_unit), .fp_op(dc_fp_op), .fp_dbl(dc_fp_dbl),
-        .fp_rm_dyn(dc_fp_rm_dyn), .uses_frs1(dc_uses_frs1), .uses_frs2(dc_uses_frs2),
-        .uses_frs3(dc_uses_frs3), .frd_we(dc_frd_we));
+        .is_fencei(dc_is_fencei), .illegal(dc_illegal));
 
     logic [31:0] rf_rd1, rf_rd2;
     logic        w_valid, w_rd_we;
@@ -161,38 +158,17 @@ module core_pipe #(
         .clk(clk), .ra1(dc_rs1), .ra2(dc_rs2), .rd1(rf_rd1), .rd2(rf_rd2),
         .we(w_valid && w_rd_we), .wa(w_rd), .wd(w_result));
 
-    // floating-point registers (x and f registers are separate files: an
-    // instruction's rs1/rs2/rd fields name one or the other, the decoder says which)
-    logic [63:0] frf_rd1, frf_rd2, frf_rd3, w_fresult;
-    logic        w_frd_we;
-
-    generate
-        if (FPU) begin : g_frf
-            fp_regfile u_frf (
-                .clk(clk), .ra1(dc_rs1), .ra2(dc_rs2), .ra3(dc_rs3), .rd1(frf_rd1), .rd2(frf_rd2),
-                .rd3(frf_rd3), .we(w_valid && w_frd_we), .wa(w_rd), .wd(w_fresult));
-        end else begin : g_no_frf
-            assign frf_rd1 = 64'd0;
-            assign frf_rd2 = 64'd0;
-            assign frf_rd3 = 64'd0;
-        end
-    endgenerate
 
     // hazards detected in ID
-    logic e_valid, e_is_load, e_rd_we, e_frd_we, m_valid;
+    logic e_valid, e_is_load, e_rd_we, m_valid;
     logic [4:0] e_rd;
-    logic load_use, fload_use, serialize;
+    logic load_use, serialize;
 
     assign load_use = e_valid && e_is_load && e_rd_we &&
                       ((dc_uses_rs1 && dc_rs1 == e_rd) || (dc_uses_rs2 && dc_rs2 == e_rd));
-    // the same for an FLW/FLD followed by a reader of that f register
-    assign fload_use = e_valid && e_is_load && e_frd_we &&
-                       ((dc_uses_frs1 && dc_rs1 == e_rd) || (dc_uses_frs2 && dc_rs2 == e_rd) ||
-                        (dc_uses_frs3 && dc_rs3 == e_rd));
     // CSR instructions run alone so counter reads see every older instruction retired
-    // (and fflags/frm/mstatus.FS are settled before any younger F/D instruction reaches EX)
     assign serialize = dc_is_csr && (e_valid || m_valid || w_valid);
-    assign d_hazard = d_valid && (load_use || fload_use || serialize);
+    assign d_hazard = d_valid && (load_use || serialize);
     assign d_hold = e_hold || d_hazard;
     assign d_fire = d_valid && !d_hold && !redirect_ex && !redirect_mem;
 
@@ -207,9 +183,8 @@ module core_pipe #(
     logic        e_is_csr, e_csr_writes, e_is_ecall, e_is_ebreak, e_is_mret, e_is_fencei, e_illegal;
     logic [15:0] e_seq;
     logic [31:0] fwd1, fwd2;
-    logic [4:0]  e_rs3, e_fp_op;
-    logic        e_is_fp, e_fp_unit, e_fp_dbl, e_fp_rm_dyn;
-    logic [63:0] e_frs1_val, e_frs2_val, e_frs3_val, ffwd1, ffwd2, ffwd3;
+    logic        e_is_atomic;
+    logic [4:0]  e_amo_op;
 
     always_ff @(posedge clk) begin
         if (rst || redirect_mem) begin
@@ -235,6 +210,8 @@ module core_pipe #(
             e_is_jalr <= dc_is_jalr;
             e_is_load <= dc_is_load;
             e_is_store <= dc_is_store;
+            e_is_atomic <= dc_is_atomic;
+            e_amo_op <= dc_amo_op;
             e_is_mdu <= dc_is_mdu;
             e_is_div <= dc_is_div;
             e_is_csr <= dc_is_csr;
@@ -268,59 +245,6 @@ module core_pipe #(
         else fwd2 = e_rs2_val;
     end
 
-    // F/D part of the ID/EX register, and the same two forwarding sources
-    // for the three floating-point operands
-    logic        m_frd_we;
-    logic [63:0] m_fresult;
-
-    generate
-        if (FPU) begin : g_fp_ex
-            always_ff @(posedge clk) begin
-                if (!e_hold) begin
-                    e_rs3 <= dc_rs3;
-                    e_frd_we <= dc_frd_we;
-                    e_is_fp <= dc_is_fp;
-                    e_fp_unit <= dc_fp_unit;
-                    e_fp_op <= dc_fp_op;
-                    e_fp_dbl <= dc_fp_dbl;
-                    e_fp_rm_dyn <= dc_fp_rm_dyn;
-                    e_frs1_val <= frf_rd1;
-                    e_frs2_val <= frf_rd2;
-                    e_frs3_val <= frf_rd3;
-                end else begin
-                    e_frs1_val <= ffwd1;
-                    e_frs2_val <= ffwd2;
-                    e_frs3_val <= ffwd3;
-                end
-            end
-        end else begin : g_no_fp_ex
-            assign e_rs3 = 5'd0;
-            assign e_frd_we = 1'b0;
-            assign e_is_fp = 1'b0;
-            assign e_fp_unit = 1'b0;
-            assign e_fp_op = 5'd0;
-            assign e_fp_dbl = 1'b0;
-            assign e_fp_rm_dyn = 1'b0;
-            assign e_frs1_val = 64'd0;
-            assign e_frs2_val = 64'd0;
-            assign e_frs3_val = 64'd0;
-            logic unused_fp_id;
-            assign unused_fp_id = &{1'b0, dc_rs3, dc_frd_we, dc_is_fp, dc_fp_unit, dc_fp_op, dc_fp_dbl,
-                                    dc_fp_rm_dyn, frf_rd1, frf_rd2, frf_rd3};
-        end
-    endgenerate
-
-    always_comb begin
-        if (m_valid && m_frd_we && !m_is_load && m_rd == e_rs1) ffwd1 = m_fresult;
-        else if (w_valid && w_frd_we && w_rd == e_rs1) ffwd1 = w_fresult;
-        else ffwd1 = e_frs1_val;
-        if (m_valid && m_frd_we && !m_is_load && m_rd == e_rs2) ffwd2 = m_fresult;
-        else if (w_valid && w_frd_we && w_rd == e_rs2) ffwd2 = w_fresult;
-        else ffwd2 = e_frs2_val;
-        if (m_valid && m_frd_we && !m_is_load && m_rd == e_rs3) ffwd3 = m_fresult;
-        else if (w_valid && w_frd_we && w_rd == e_rs3) ffwd3 = w_fresult;
-        else ffwd3 = e_frs3_val;
-    end
 
     // ALU, branch unit, multiplier, divider
     logic [31:0] alu_a, alu_b, alu_y, e_pc4, br_target, target, actual_next;
@@ -359,40 +283,15 @@ module core_pipe #(
         .clk(clk), .rst(rst), .start(e_valid && e_is_div && !redirect_mem), .kill(redirect_mem),
         .ack(e_fire), .op(e_funct3[1:0]), .a(fwd1), .b(fwd2), .done(div_done), .result(div_y));
 
-    // floating-point unit: like the divider, the instruction waits in EX until it is done
-    logic [2:0]  frm, e_fp_rm;
-    logic        fs_off, e_fp_ill, fpu_done;
-    logic [63:0] fpu_result;
-    logic [31:0] fpu_iresult;
-    logic [4:0]  fpu_flags;
 
-    // two F/D checks need CSR state: mstatus.FS must be on, a dynamic rounding mode must be valid
-    assign e_fp_ill = e_is_fp && (fs_off || (e_fp_rm_dyn && frm > 3'd4));
-    assign e_fp_rm = (e_funct3 == 3'b111) ? frm : e_funct3;
-
-    generate
-        if (FPU) begin : g_fpu
-            fpu u_fpu (
-                .clk(clk), .rst(rst), .start(e_valid && e_fp_unit && !e_fp_ill && !redirect_mem),
-                .kill(redirect_mem), .ack(e_fire), .op(e_fp_op), .dbl(e_fp_dbl), .rm(e_fp_rm),
-                .a(ffwd1), .b(ffwd2), .c(ffwd3), .ia(fwd1), .done(fpu_done), .result(fpu_result),
-                .iresult(fpu_iresult), .flags(fpu_flags));
-        end else begin : g_no_fpu
-            assign fpu_done = 1'b1;
-            assign fpu_result = 64'd0;
-            assign fpu_iresult = 32'd0;
-            assign fpu_flags = 5'd0;
-        end
-    endgenerate
-
-    assign e_busy = e_valid && ((e_is_div && !div_done) || (e_fp_unit && !e_fp_ill && !fpu_done));
+    assign e_busy = e_valid && e_is_div && !div_done;
 
     // memory address checks (the access itself happens in MEM)
     logic [31:0] st_wdata, ld_data_unused;
     logic [3:0]  st_wmask;
     logic        e_misaligned;
     lsu_align u_align_ex (
-        .funct3(e_funct3), .offset(alu_y[1:0]), .store_data(e_is_fp ? ffwd2[31:0] : fwd2),
+        .funct3(e_funct3), .offset(alu_y[1:0]), .store_data(fwd2),
         .wdata(st_wdata), .wmask(st_wmask),
         .rdata(32'd0), .load_data(ld_data_unused), .misaligned(e_misaligned));
 
@@ -404,7 +303,7 @@ module core_pipe #(
         e_exc = 1'b1;
         e_cause = `CAUSE_ILLEGAL;
         e_tval = e_insn;
-        if (e_illegal || (e_is_csr && csr_illegal) || e_fp_ill) begin
+        if (e_illegal || (e_is_csr && csr_illegal)) begin
             e_cause = `CAUSE_ILLEGAL;
             e_tval = e_insn;
         end else if (e_is_ecall) begin
@@ -417,10 +316,13 @@ module core_pipe #(
             e_cause = `CAUSE_MISALIGNED_FETCH;
             e_tval = target;
         end else if (e_is_load && e_misaligned) begin
-            e_cause = `CAUSE_MISALIGNED_LOAD;
+            e_cause = (e_is_atomic && e_amo_op != `AMO_LR) ? `CAUSE_MISALIGNED_STORE : `CAUSE_MISALIGNED_LOAD;
             e_tval = alu_y;
         end else if (e_is_store && e_misaligned) begin
             e_cause = `CAUSE_MISALIGNED_STORE;
+            e_tval = alu_y;
+        end else if (e_is_atomic && !alu_y[31]) begin   // atomics need cacheable memory
+            e_cause = (e_amo_op != `AMO_LR) ? `CAUSE_STORE_FAULT : `CAUSE_LOAD_FAULT;
             e_tval = alu_y;
         end else begin
             e_exc = 1'b0;
@@ -428,16 +330,14 @@ module core_pipe #(
     end
 
     logic        w_trap, w_no_count;
-    csr_file #(.FPU(FPU)) u_csr (
+    csr_file #(.HARTID(HARTID)) u_csr (
         .clk(clk), .rst(rst), .addr(e_insn[31:20]), .op(e_funct3[1:0]),
         .src(e_funct3[2] ? {27'd0, e_rs1} : fwd1), .writes(e_csr_writes),
         .we(e_fire && e_is_csr && !e_exc), .rdata(csr_rdata), .illegal(csr_illegal),
         .writes_instret(csr_writes_instret),
         .trap(e_fire && e_exc), .trap_pc(e_pc), .trap_cause(e_cause), .trap_tval(e_tval),
         .mret(e_fire && e_is_mret && !e_exc), .mtvec(mtvec), .mepc(mepc),
-        .instret_inc(w_valid && !w_trap && !w_no_count), .events(perf_events),
-        .fp_flags(fpu_flags), .fp_flags_we(e_fire && e_fp_unit && !e_exc),
-        .fp_dirty(e_fire && e_frd_we && !e_exc), .frm(frm), .fs_off(fs_off));
+        .instret_inc(w_valid && !w_trap && !w_no_count), .events(perf_events));
 
     always_comb begin
         if (e_exc) actual_next = mtvec;
@@ -457,7 +357,6 @@ module core_pipe #(
             `WB_PC4: e_res_early = e_pc4;
             `WB_CSR: e_res_early = csr_rdata;
             `WB_MDU: e_res_early = div_y;
-            `WB_FPU: e_res_early = FPU ? fpu_iresult : alu_y;   // never selected without the FPU
             default: e_res_early = alu_y;   // loads: the address
         endcase
     end
@@ -471,16 +370,12 @@ module core_pipe #(
     assign redirect_ex_pc = actual_next;
 
     // =========================================================== MEM stage
-    logic        m_is_store, m_is_fencei, m_trap, m_no_count;
+    logic        m_is_store, m_is_atomic, m_is_fencei, m_trap, m_no_count;
+    logic [4:0]  m_amo_op;
     logic [31:0] m_insn, m_addr, m_cause, m_wdata;
     logic [3:0]  m_wmask;
     logic [2:0]  m_funct3;
     logic [15:0] m_seq;
-    // FLD/FSD: two word accesses.  After the first one m_addr moves on by 4,
-    // the two store words swap places and the first load word is kept in m_lo.
-    logic        m_mem_dbl, m_beat, m_more, beat_adv;
-    logic [31:0] m_wdata_hi, m_lo, m_addr4;
-    logic [4:0]  m_fflags;
 
     always_ff @(posedge clk) begin
         if (rst) begin
@@ -494,6 +389,8 @@ module core_pipe #(
             m_rd_we <= e_rd_we && !e_exc;
             m_is_load <= e_is_load && !e_exc;
             m_is_store <= e_is_store && !e_exc;
+            m_is_atomic <= e_is_atomic && !e_exc;
+            m_amo_op <= e_amo_op;
             m_is_fencei <= e_is_fencei && !e_exc;
             m_trap <= e_exc;
             m_cause <= e_cause;
@@ -503,69 +400,31 @@ module core_pipe #(
             m_result <= e_result;
             m_wdata <= st_wdata;
             m_wmask <= st_wmask;
-        end else if (beat_adv) begin
-            m_addr <= m_addr4;
-            m_wdata <= m_wdata_hi;
         end
     end
 
-    // F/D part of the EX/MEM register
-    generate
-        if (FPU) begin : g_fp_mem
-            always_ff @(posedge clk) begin
-                if (rst) begin
-                    m_beat <= 1'b0;
-                end else if (!m_stall) begin
-                    m_beat <= 1'b0;
-                    m_frd_we <= e_frd_we && !e_exc;
-                    m_fresult <= fpu_result;
-                    m_fflags <= (e_fp_unit && !e_exc) ? fpu_flags : 5'd0;
-                    m_mem_dbl <= e_is_fp && e_fp_dbl && (e_is_load || e_is_store) && !e_exc;
-                    m_wdata_hi <= ffwd2[63:32];
-                end else if (beat_adv) begin
-                    m_beat <= 1'b1;
-                    m_wdata_hi <= m_wdata;
-                    m_lo <= dc_rdata;
-                end
-            end
-        end else begin : g_no_fp_mem
-            assign m_beat = 1'b0;
-            assign m_frd_we = 1'b0;
-            assign m_fresult = 64'd0;
-            assign m_fflags = 5'd0;
-            assign m_mem_dbl = 1'b0;
-            assign m_wdata_hi = 32'd0;
-            assign m_lo = 32'd0;
-        end
-    endgenerate
 
-    // FENCE.I: write back the D-cache, then invalidate the I-cache, then
-    // refetch the next instruction (redirect from MEM).
-    logic fi_dc_done, fi_ic_done, dc_flush_done, ic_inv_done, dc_flush_req, ic_inv_req;
-    assign dc_flush_req = m_valid && m_is_fencei && !fi_dc_done;
-    assign ic_inv_req = m_valid && m_is_fencei && fi_dc_done && !fi_ic_done;
+    // FENCE.I: invalidate the I-cache, then refetch the next instruction
+    // (redirect from MEM).  The D-cache needs no write-back: instruction
+    // fetches are snooped (IRD), so a dirty line in any data cache - this
+    // hart's or another's - is what the I-cache gets.
+    logic fi_ic_done, ic_inv_done, ic_inv_req;
+    assign ic_inv_req = m_valid && m_is_fencei && !fi_ic_done;
 
     always_ff @(posedge clk) begin
-        if (rst || m_fire) begin
-            fi_dc_done <= 1'b0;
-            fi_ic_done <= 1'b0;
-        end else begin
-            if (dc_flush_done) fi_dc_done <= 1'b1;
-            if (ic_inv_done) fi_ic_done <= 1'b1;
-        end
+        if (rst || m_fire) fi_ic_done <= 1'b0;
+        else if (ic_inv_done) fi_ic_done <= 1'b1;
     end
 
-    logic        dc_req, dc_ready, dc_ev_access, dc_ev_miss, dc_ev_wb;
-    logic [31:0] dc_rdata, ld_data, unused_wdata;
+    logic        dc_req, dc_ready, dc_wrote;
+    logic [31:0] dc_rdata, dc_wword, ld_data, unused_wdata;
     logic [3:0]  unused_wmask;
     logic        unused_mis;
+    logic        dc_ev_access, dc_ev_miss, dc_ev_wb, dc_ev_rd, dc_ev_rdx, dc_ev_upgr, dc_ev_inv, dc_ev_supply,
+                 dc_ev_scfail;
 
     assign dc_req = m_valid && (m_is_load || m_is_store);
-    assign m_more = m_mem_dbl && !m_beat;            // the second word is still to come
-    assign beat_adv = dc_req && dc_ready && m_more;  // the first word completes this cycle
-    assign m_addr4 = m_addr + 32'd4;
-    assign m_stall = m_valid && ((dc_req && (!dc_ready || m_more)) ||
-                                 (m_is_fencei && !(fi_dc_done && fi_ic_done)));
+    assign m_stall = m_valid && ((dc_req && !dc_ready) || (m_is_fencei && !fi_ic_done));
     assign m_fire = m_valid && !m_stall;
     assign redirect_mem = m_fire && m_is_fencei;
 
@@ -578,11 +437,6 @@ module core_pipe #(
     logic [3:0]  w_mem_wmask;
     logic        w_mem_we;
     logic [15:0] w_seq;
-    logic [4:0]  w_fflags;
-    logic        w_mem_dbl;
-    logic [31:0] w_mem_wdata_hi, m_addr_first;
-
-    assign m_addr_first = m_beat ? m_addr - 32'd4 : m_addr;
 
     always_ff @(posedge clk) begin
         if (rst) begin
@@ -598,33 +452,13 @@ module core_pipe #(
             w_trap <= m_trap;
             w_cause <= m_cause;
             w_no_count <= m_no_count;
-            w_mem_we <= m_is_store;
-            w_mem_addr <= {m_addr_first[31:2], 2'b00};
-            w_mem_wdata <= m_beat ? m_wdata_hi : m_wdata;
+            w_mem_we <= m_is_store || (m_is_atomic && dc_wrote);
+            w_mem_addr <= {m_addr[31:2], 2'b00};
+            w_mem_wdata <= m_is_atomic ? dc_wword : m_wdata;
             w_mem_wmask <= m_wmask;
         end
     end
 
-    // F/D part of the MEM/WB register
-    generate
-        if (FPU) begin : g_fp_wb
-            always_ff @(posedge clk) begin
-                w_frd_we <= m_frd_we;
-                if (!m_is_load) w_fresult <= m_fresult;
-                else if (m_mem_dbl) w_fresult <= {ld_data, m_lo};
-                else w_fresult <= {32'hffff_ffff, ld_data};       // FLW: NaN-boxed
-                w_fflags <= m_fflags;
-                w_mem_dbl <= m_mem_dbl && m_is_store;
-                w_mem_wdata_hi <= m_wdata;
-            end
-        end else begin : g_no_fp_wb
-            assign w_frd_we = 1'b0;
-            assign w_fresult = 64'd0;
-            assign w_fflags = 5'd0;
-            assign w_mem_dbl = 1'b0;
-            assign w_mem_wdata_hi = 32'd0;
-        end
-    endgenerate
 
     assign commit_valid = w_valid;
     assign commit_pc = w_pc;
@@ -638,41 +472,26 @@ module core_pipe #(
     assign commit_mem_addr = w_mem_addr;
     assign commit_mem_wdata = w_mem_wdata;
     assign commit_mem_wmask = w_mem_wmask;
-    assign commit_frd_we = w_frd_we;
-    assign commit_frd_val = w_fresult;
-    assign commit_fflags = w_fflags;
-    assign commit_mem_dbl = w_mem_dbl;
-    assign commit_mem_wdata_hi = w_mem_wdata_hi;
 
     // ======================================================== caches, bus
-    logic         ic_bus_req, ic_bus_ack, ic_ev_miss;
-    logic [31:0]  ic_bus_addr;
-    logic         dc_bus_req, dc_bus_we, dc_bus_ack;
-    logic [31:0]  dc_bus_addr;
-    logic [127:0] dc_bus_wdata;
-    logic [15:0]  dc_bus_wstrb;
+    logic ic_ev_miss;
 
     icache #(.SETS(ICACHE_SETS)) u_icache (
-        .clk(clk), .rst(rst), .addr_next(pc_next), .addr(pc_f), .kill(redirect_ex || redirect_mem),
+        .clk(clk), .rst(sys_rst), .addr_next(pc_next), .addr(pc_f), .kill(redirect_ex || redirect_mem),
         .hit(ic_hit), .insn(ic_insn), .inv_req(ic_inv_req), .inv_done(ic_inv_done), .ev_miss(ic_ev_miss),
-        .bus_req(ic_bus_req), .bus_addr(ic_bus_addr), .bus_ack(ic_bus_ack), .bus_rdata(bus_rdata));
+        .bus_req(ibus_req), .bus_addr(ibus_addr), .bus_ack(ibus_ack), .bus_rdata(bus_rdata));
 
-    dcache #(.SETS(DCACHE_SETS)) u_dcache (
-        .clk(clk), .rst(rst), .addr_next(beat_adv ? m_addr4 : m_stall ? m_addr : alu_y), .req(dc_req), .we(m_is_store),
-        .addr(m_addr), .wdata(m_wdata), .wmask(m_wmask), .ready(dc_ready), .rdata(dc_rdata),
-        .flush_req(dc_flush_req), .flush_done(dc_flush_done),
-        .ev_access(dc_ev_access), .ev_miss(dc_ev_miss), .ev_wb(dc_ev_wb),
-        .bus_req(dc_bus_req), .bus_we(dc_bus_we), .bus_addr(dc_bus_addr), .bus_wdata(dc_bus_wdata),
-        .bus_wstrb(dc_bus_wstrb), .bus_ack(dc_bus_ack), .bus_rdata(bus_rdata));
-
-    mem_arbiter u_arb (
-        .clk(clk), .rst(rst),
-        .m0_req(dc_bus_req), .m0_we(dc_bus_we), .m0_addr(dc_bus_addr), .m0_wdata(dc_bus_wdata),
-        .m0_wstrb(dc_bus_wstrb), .m0_ack(dc_bus_ack),
-        .m1_req(ic_bus_req), .m1_we(1'b0), .m1_addr(ic_bus_addr), .m1_wdata(128'd0),
-        .m1_wstrb(16'd0), .m1_ack(ic_bus_ack),
-        .bus_req(bus_req), .bus_we(bus_we), .bus_addr(bus_addr), .bus_wdata(bus_wdata),
-        .bus_wstrb(bus_wstrb), .bus_ack(bus_ack));
+    l1d #(.SETS(DCACHE_SETS), .BUG(BUG), .LOCKOUT(LOCKOUT)) u_l1d (
+        .clk(clk), .rst(sys_rst), .addr_next(m_stall ? m_addr : alu_y), .req(dc_req), .we(m_is_store),
+        .atomic(m_is_atomic), .amo_op(m_amo_op), .addr(m_addr), .wdata(m_wdata), .wmask(m_wmask),
+        .ready(dc_ready), .rdata(dc_rdata), .wrote(dc_wrote), .wword(dc_wword),
+        .bus_req(dbus_req), .bus_cmd(dbus_cmd), .bus_addr(dbus_addr), .bus_wdata(dbus_wdata),
+        .bus_wstrb(dbus_wstrb), .bus_ack(dbus_ack), .bus_rdata(bus_rdata), .bus_shared(bus_shared),
+        .snp_valid(snp_valid), .snp_cmd(snp_cmd), .snp_addr(snp_addr), .snp_done(snp_done),
+        .snp_hit(snp_hit), .snp_supply(snp_supply), .snp_data(snp_data),
+        .ev_access(dc_ev_access), .ev_miss(dc_ev_miss), .ev_wb(dc_ev_wb), .ev_rd(dc_ev_rd),
+        .ev_rdx(dc_ev_rdx), .ev_upgr(dc_ev_upgr), .ev_inv(dc_ev_inv), .ev_supply(dc_ev_supply),
+        .ev_scfail(dc_ev_scfail), .trace(trace));
 
     // ========================================================= predictor
     // calls and returns, by the register-use hints of the ISA (ra = x1, t0 = x5)
@@ -698,27 +517,18 @@ module core_pipe #(
         perf_events[`EV_BRANCH_MISS] = e_fire && !e_exc && e_is_branch && redirect_ex;
         perf_events[`EV_JUMP] = e_fire && !e_exc && (e_is_jal || e_is_jalr);
         perf_events[`EV_JUMP_MISS] = e_fire && !e_exc && (e_is_jal || e_is_jalr) && redirect_ex;
-        perf_events[`EV_LOAD_USE] = d_valid && (load_use || fload_use) && !e_hold && !redirect_ex && !redirect_mem;
+        perf_events[`EV_LOAD_USE] = d_valid && load_use && !e_hold && !redirect_ex && !redirect_mem;
         perf_events[`EV_ICACHE_ACCESS] = f_fire;
+        perf_events[`EV_BUS_RD] = dc_ev_rd;
+        perf_events[`EV_BUS_RDX] = dc_ev_rdx;
+        perf_events[`EV_BUS_UPGR] = dc_ev_upgr;
+        perf_events[`EV_SNOOP_INV] = dc_ev_inv;
+        perf_events[`EV_SNOOP_SUPPLY] = dc_ev_supply;
+        perf_events[`EV_SC_FAIL] = dc_ev_scfail;
     end
-
-    // ========================================================= probes
-    assign dbg_f_pc = pc_f;
-    assign dbg_f_seq = f_seq;
-    assign dbg_d_valid = d_valid;
-    assign dbg_d_seq = d_seq;
-    assign dbg_d_pc = d_pc;
-    assign dbg_d_insn = d_insn;
-    assign dbg_e_valid = e_valid;
-    assign dbg_e_seq = e_seq;
-    assign dbg_m_valid = m_valid;
-    assign dbg_m_seq = m_seq;
-    assign dbg_w_valid = w_valid;
-    assign dbg_w_seq = w_seq;
-    assign dbg_why = {redirect_mem, redirect_ex, m_stall, e_busy, d_hazard, !ic_hit};
 
     logic unused;
     assign unused = &{1'b0, d_pred_taken, dc_is_mdu, dc_is_jal, ld_data_unused, unused_wdata,
-                      unused_wmask, unused_mis, e_is_mdu, mul_p[65:64], w_cause[31:0], m_addr_first[1:0],
-                      e_fp_op, e_fp_rm, e_fp_dbl, ffwd1, ffwd2, ffwd3, fpu_result, m_lo, m_fflags};
+                      unused_wmask, unused_mis, e_is_mdu, mul_p[65:64], w_cause[31:0], f_seq, d_seq, e_seq,
+                      m_seq, w_seq};
 endmodule

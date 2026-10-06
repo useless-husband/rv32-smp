@@ -15,22 +15,24 @@
 #define RV_RAM_BASE   RV_U(0x80000000)  /* cacheable RAM: every address with bit 31 set */
 #define RV_RAM_SIZE   RV_U(0x00100000)  /* 1 MiB */
 
-/* Uncached I/O (bit 31 clear).  Writes only; reads return 0. */
+/* Uncached I/O (bit 31 clear).  Reads return 0 except RV_MMIO_NHARTS. */
 #define RV_MMIO_CONSOLE RV_U(0x10000000) /* store: low byte goes to the console */
 #define RV_MMIO_EXIT    RV_U(0x10000004) /* store: stop the simulation (HTIF style:
                                        1 = pass, (n << 1) | 1 = exit code n) */
+#define RV_MMIO_NHARTS  RV_U(0x10000008) /* load: number of harts */
 #define RV_MMIO_BASE    RV_U(0x10000000)
 #define RV_MMIO_SIZE    RV_U(0x00001000)
 
 /* Machine-mode hardware performance counters mhpmcounter3..12.  Each is
  * hard-wired to one event (there are no mhpmevent selectors). */
 #define RV_HPM_FIRST 3
-#define RV_HPM_COUNT 10
+#define RV_HPM_COUNT 16
 #ifndef __ASSEMBLER__
 #define RV_HPM_NAMES {                                   \
     "icache_misses", "dcache_accesses", "dcache_misses", \
     "dcache_writebacks", "branches", "branch_mispredicts", \
-    "jumps", "jump_mispredicts", "load_use_stalls", "icache_accesses" }
+    "jumps", "jump_mispredicts", "load_use_stalls", "icache_accesses", \
+    "bus_rd", "bus_rdx", "bus_upgr", "snoop_invalidations", "snoop_supplies", "sc_failures" }
 #endif
 
 #endif

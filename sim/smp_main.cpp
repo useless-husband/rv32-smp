@@ -1,29 +1,26 @@
-// Verilator harness shared by both cores (the model class is always Vtop).
+// Verilator harness for the multicore (rtl/sim/smp_top.sv).
 //
-// Runs a RISC-V ELF program on the simulated core and, unless --no-lockstep
-// is given, steps the golden model (model/rv_iss.c) once for every record
-// the core puts on its commit port and compares the two field by field.
-// The first difference stops the run with a report.
+// Each cycle it
+//   1. reads every L1's trace record and feeds the accesses performed in
+//      that cycle to the golden memory checker (sim/memcheck.h), which keeps
+//      memory in perform order and checks every value read;
+//   2. optionally steps the protocol model (model/mesi.hpp) with every
+//      coherence event (miss, bus grant, snoop answer, fill, write-back) and
+//      checks that the model allows it and reaches the same line states;
+//   3. checks every committed instruction of every hart against that hart's
+//      own golden model instance (lockstep).  A load's value depends on how
+//      the harts interleave, so the model takes it from the access the L1
+//      performed - already checked in step 1 - and checks everything else.
 //
-//   vsim [options] program.elf
-//     --max-cycles N     give up after N cycles (default 200M)
-//     --no-lockstep      do not run the golden model
-//     --trace FILE       write the commit trace
-//     --json FILE        write cycle/instret/event counts as JSON
-//     --pipeview FILE    record per-cycle pipeline occupancy (pipelined core)
-//     --pv-from N        ... starting at cycle N (default 0)
-//     --pv-cycles N      ... for N cycles (default 400)
-//     --stats            print the statistics
-//     --quiet            do not echo the program's console output
-//
-// Exit status: 0 = the program exited with code 0, 1 = it exited with
-// another code (printed), 2 = lockstep mismatch, 3 = cycle limit,
-// 4 = golden-model error, 5 = usage or load error.
+// Timing noise for the litmus and stress tests: --stall-pct injects fetch
+// bubbles per hart, --jitter adds random latency to memory requests.
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <memory>
+#include <random>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -34,22 +31,42 @@
 extern "C" {
 #include "rv_iss.h"
 }
+#include "memcheck.h"
+#include "mesi.hpp"
+#include "trace.h"
 
 static const char *kEventNames[] = RV_HPM_NAMES;
 
-double sc_time_stamp() { return 0; } // needed by libverilated when not using SystemC
+double sc_time_stamp() { return 0; }
+
+// ----------------------------------------------------- bit access helpers
+static uint32_t gb(uint64_t v, int lo, int n)
+{
+    return (uint32_t)((v >> lo) & (n >= 32 ? 0xffffffffull : ((1ull << n) - 1)));
+}
+template <std::size_t W> static uint32_t gb(const VlWide<W> &v, int lo, int n)
+{
+    uint64_t x = v[(size_t)lo / 32];
+    if ((size_t)lo / 32 + 1 < W) x |= (uint64_t)v[(size_t)lo / 32 + 1] << 32;
+    return gb(x, lo % 32, n);
+}
 
 struct Options {
-    std::string elf, trace, json, pipeview;
+    std::string elf, json, coh_log, trace;
     uint64_t max_cycles = 200000000ull;
-    uint64_t pv_from = 0, pv_cycles = 400;
-    bool lockstep = true, stats = false, quiet = false;
+    bool lockstep = true, stats = false, quiet = false, model = false;
+    int run_hart = -1;           // -1: all harts run
+    uint32_t seed = 1;
+    int stall_pct = 0, jitter = 0;
+    int model_bug = -1;          // protocol variant the model follows (-1: the one the RTL was built with)
 };
 
 static void usage()
 {
-    std::fprintf(stderr, "usage: vsim [--max-cycles N] [--no-lockstep] [--trace FILE] [--json FILE]\n"
-                         "            [--pipeview FILE] [--pv-from N] [--pv-cycles N] [--stats] [--quiet] prog.elf\n");
+    std::fprintf(stderr,
+                 "usage: vsmp [--max-cycles N] [--no-lockstep] [--run-hart K] [--seed S] [--stall-pct P]\n"
+                 "            [--jitter J] [--model] [--coh-log FILE] [--trace FILE] [--json FILE] [--stats]\n"
+                 "            [--quiet] prog.elf\n");
     std::exit(5);
 }
 
@@ -61,11 +78,14 @@ static Options parse(int argc, char **argv)
         auto next = [&]() -> const char * { if (i + 1 >= argc) usage(); return argv[++i]; };
         if (a == "--max-cycles") o.max_cycles = std::strtoull(next(), nullptr, 0);
         else if (a == "--no-lockstep") o.lockstep = false;
+        else if (a == "--run-hart") o.run_hart = std::atoi(next());
+        else if (a == "--seed") o.seed = (uint32_t)std::strtoul(next(), nullptr, 0);
+        else if (a == "--stall-pct") o.stall_pct = std::atoi(next());
+        else if (a == "--jitter") o.jitter = std::atoi(next());
+        else if (a == "--model") o.model = true;
+        else if (a == "--coh-log") o.coh_log = next();
         else if (a == "--trace") o.trace = next();
         else if (a == "--json") o.json = next();
-        else if (a == "--pipeview") o.pipeview = next();
-        else if (a == "--pv-from") o.pv_from = std::strtoull(next(), nullptr, 0);
-        else if (a == "--pv-cycles") o.pv_cycles = std::strtoull(next(), nullptr, 0);
         else if (a == "--stats") o.stats = true;
         else if (a == "--quiet") o.quiet = true;
         else if (a[0] != '-' && o.elf.empty()) o.elf = a;
@@ -75,61 +95,51 @@ static Options parse(int argc, char **argv)
     return o;
 }
 
-static rv_commit dut_commit(const Vtop *t)
-{
-    rv_commit c;
-    std::memset(&c, 0, sizeof c);
-    c.pc = t->commit_pc;
-    c.insn = t->commit_insn;
-    c.trap = t->commit_trap;
-    c.cause = c.trap ? t->commit_cause : 0;
-    c.rd_we = t->commit_rd_we;
-    c.rd = c.rd_we ? t->commit_rd : 0;
-    c.rd_val = c.rd_we ? t->commit_rd_val : 0;
-    c.mem_we = t->commit_mem_we;
-    c.mem_addr = c.mem_we ? t->commit_mem_addr : 0;
-    c.mem_wmask = c.mem_we ? t->commit_mem_wmask : 0;
-    // only the written byte lanes are meaningful (the cores replicate SB/SH data)
-    uint32_t lanes = 0;
-    for (int b = 0; b < 4; b++)
-        if ((c.mem_wmask >> b) & 1) lanes |= 0xffu << (8 * b);
-    c.mem_wdata = c.mem_we ? (t->commit_mem_wdata & lanes) : 0;
-    // F and D (constant zero on a core without the FPU)
-    c.frd_we = t->commit_frd_we;
-    c.frd = c.frd_we ? t->commit_rd : 0;
-    c.frd_val = c.frd_we ? t->commit_frd_val : 0;
-    c.fflags = c.trap ? 0 : t->commit_fflags;
-    c.mem_dbl = c.mem_we && t->commit_mem_dbl;
-    c.mem_wdata_hi = c.mem_dbl ? t->commit_mem_wdata_hi : 0;
-    return c;
-}
+// ------------------------------------------------- lockstep data hook
+struct Harness {
+    std::vector<std::deque<L1Trace>> q;   // performed, not yet committed, per hart
+    std::string error;
+};
 
-static bool same(const rv_commit &a, const rv_commit &b)
+static uint32_t data_hook(void *ctx, uint32_t hart, int kind, uint32_t addr, int size, uint32_t wv, int *sc_ok)
 {
-    return a.pc == b.pc && a.insn == b.insn && a.trap == b.trap && a.cause == b.cause && a.rd_we == b.rd_we &&
-           a.rd == b.rd && a.rd_val == b.rd_val && a.mem_we == b.mem_we && a.mem_addr == b.mem_addr &&
-           a.mem_wdata == b.mem_wdata && a.mem_wmask == b.mem_wmask && a.frd_we == b.frd_we &&
-           a.frd == b.frd && a.frd_val == b.frd_val && a.fflags == b.fflags && a.mem_dbl == b.mem_dbl &&
-           a.mem_wdata_hi == b.mem_wdata_hi;
+    Harness *H = (Harness *)ctx;
+    (void)wv;
+    if (!H->error.empty()) return 0;
+    if (H->q[hart].empty()) {
+        char b[160];
+        std::snprintf(b, sizeof b, "hart %u: the model executes a %s at %08x the L1 never performed", hart,
+                      kind_name(kind), addr);
+        H->error = b;
+        return 0;
+    }
+    L1Trace e = H->q[hart].front();
+    H->q[hart].pop_front();
+    if (e.perf_kind != kind || (e.perf_addr & ~3u) != (addr & ~3u)) {
+        char b[200];
+        std::snprintf(b, sizeof b, "hart %u: the model executes a %s at %08x, the L1 performed a %s at %08x", hart,
+                      kind_name(kind), addr, kind_name(e.perf_kind), e.perf_addr);
+        H->error = b;
+        return 0;
+    }
+    if (sc_ok) *sc_ok = e.sc_ok;
+    uint32_t sh = 8 * (addr & 3);
+    uint32_t v = e.perf_old >> sh;
+    return size == 1 ? (v & 0xff) : size == 2 ? (v & 0xffff) : v;
 }
-
-#ifdef HAVE_PIPEVIEW
-#include "pipeview.inc"
-#endif
 
 int main(int argc, char **argv)
 {
     Options opt = parse(argc, argv);
 
-    rv_iss iss;
-    if (rv_iss_init(&iss) || rv_iss_load_elf(&iss, opt.elf.c_str())) {
-        std::fprintf(stderr, "vsim: %s\n", iss.errmsg);
+    rv_iss iss0;
+    if (rv_iss_init(&iss0) || rv_iss_load_elf(&iss0, opt.elf.c_str())) {
+        std::fprintf(stderr, "vsmp: %s\n", iss0.errmsg);
         return 5;
     }
-    // The RTL memory is loaded with $readmemh from a private temporary file.
     std::string hex = opt.elf + "." + std::to_string(getpid()) + ".hex";
-    if (rv_iss_write_hex(&iss, hex.c_str())) {
-        std::fprintf(stderr, "vsim: cannot write %s\n", hex.c_str());
+    if (rv_iss_write_hex(&iss0, hex.c_str())) {
+        std::fprintf(stderr, "vsmp: cannot write %s\n", hex.c_str());
         return 5;
     }
     std::string plus = "+program=" + hex;
@@ -139,17 +149,42 @@ int main(int argc, char **argv)
     ctx->commandArgs(2, vargs);
     auto top = std::make_unique<Vtop>(ctx.get());
     top->eval();
-    iss.has_fpu = top->cfg_fpu; // the golden model implements what the core was built with
+    const int N = (int)top->cfg_nharts;
+    const int bug = (int)top->cfg_bug;
+    if (opt.run_hart >= N) {
+        std::fprintf(stderr, "vsmp: --run-hart %d but the build has %d harts\n", opt.run_hart, N);
+        return 5;
+    }
 
+    // golden models: one per hart, sharing hart 0's RAM image
+    Harness H;
+    H.q.resize((size_t)N);
+    std::vector<rv_iss> iss((size_t)N);
+    iss0.nharts = (uint32_t)N;
+    MemCheck mc;
+    mc.init(iss0.ram, RV_RAM_SIZE, N);
+    for (int h = 0; h < N; h++) {
+        if (h == 0) iss[0] = iss0;
+        else rv_iss_init_shared(&iss[(size_t)h], &iss[0], (uint32_t)h);
+        iss[(size_t)h].nharts = (uint32_t)N;
+        iss[(size_t)h].data_hook = data_hook;
+        iss[(size_t)h].hook_ctx = &H;
+    }
+    for (int h = 1; h < N; h++) iss[(size_t)h].ram = iss[0].ram;
+
+    // the protocol model, stepped with the RTL's coherence events
+    mesi::Agreement agree(N, opt.model_bug >= 0 ? opt.model_bug : bug);
+    FILE *coh = opt.coh_log.empty() ? nullptr : std::fopen(opt.coh_log.c_str(), "w");
     FILE *trace = opt.trace.empty() ? nullptr : std::fopen(opt.trace.c_str(), "w");
-#ifdef HAVE_PIPEVIEW
-    PipeView pv(opt.pipeview, opt.pv_from, opt.pv_cycles);
-#else
-    if (!opt.pipeview.empty()) std::fprintf(stderr, "vsim: --pipeview needs the pipelined core\n");
-#endif
+
+    std::mt19937 rng(opt.seed);
+    uint32_t run_mask = opt.run_hart < 0 ? (1u << N) - 1 : 1u << opt.run_hart;
 
     top->clk = 0;
     top->rst = 1;
+    top->hart_run = 0;
+    top->hart_stall = 0;
+    top->mem_jitter = 0;
     for (int i = 0; i < 4; i++) {
         top->clk = 0; top->eval();
         top->clk = 1; top->eval();
@@ -157,55 +192,123 @@ int main(int argc, char **argv)
     std::remove(hex.c_str());
     top->clk = 0;
     top->rst = 0;
+    top->hart_run = run_mask;
     top->eval();
 
-    uint64_t cycle = 0, commits = 0, retired = 0;
-    uint64_t events[RV_HPM_COUNT] = {0};
+    uint64_t cycle = 0, commits = 0;
+    std::vector<uint64_t> retired((size_t)N, 0);
+    std::vector<uint64_t> events((size_t)(N * RV_HPM_COUNT), 0);
+    uint64_t bus_cmds[8] = {0}, bus_busy = 0, bus_supplied = 0;
     std::string console;
     bool exited = false;
     uint32_t exit_value = 0;
     uint64_t exit_cycle = 0;
-    int status = -1;
-    std::vector<std::string> recent; // last few commits, printed on a mismatch
+    int status = -1;            // harness verdict: 2 lockstep, 3 timeout, 4 model error, 6 memory, 7 protocol model
+    int prog_code = -1;         // the program's exit code
+    bool busy = false;
+    std::vector<std::vector<std::string>> recent((size_t)N);
     char line[320];
+    std::vector<L1Trace> tr((size_t)N);
+    uint32_t w[8];
 
-    while (status < 0) {
+    while (status < 0 && prog_code < 0) {
+        // timing noise for the next edge
+        uint32_t stall = 0;
+        if (opt.stall_pct > 0)
+            for (int h = 0; h < N; h++)
+                if ((int)(rng() % 100) < opt.stall_pct) stall |= 1u << h;
+        top->hart_stall = stall;
+        top->mem_jitter = opt.jitter > 0 ? (uint8_t)(rng() % (uint32_t)(opt.jitter + 1)) : 0;
         top->clk = 0;
         top->eval();
 
-        if (top->commit_valid) {
-            rv_commit d = dut_commit(top.get());
-            commits++;
-            if (!d.trap) retired++;
-            rv_format_commit(&d, line, sizeof line);
-            if (trace) std::fprintf(trace, "%s\n", line);
-            if (opt.lockstep) {
-                rv_commit m;
-                iss.have_override = 1;
-                iss.override_val = d.rd_val;
-                rv_step(&iss, &m);
-                if (m.nondet && m.rd_we) m.rd_val = d.rd_val; // counter reads are timing dependent
-                if (iss.error) {
-                    std::fprintf(stderr, "vsim: golden model error: %s\n", iss.errmsg);
-                    status = 4;
-                    break;
-                }
-                if (!same(d, m)) {
-                    char ml[320];
-                    rv_format_commit(&m, ml, sizeof ml);
-                    std::fprintf(stderr, "\nLOCKSTEP MISMATCH at commit %" PRIu64 ", cycle %" PRIu64 "\n", commits, cycle);
-                    std::fprintf(stderr, "  last matching commits:\n");
-                    for (auto &r : recent) std::fprintf(stderr, "    %s\n", r.c_str());
-                    std::fprintf(stderr, "  core : %s\n  model: %s\n", line, ml);
-                    status = 2;
-                    break;
-                }
-                recent.push_back(line);
-                if (recent.size() > 8) recent.erase(recent.begin());
+        // 1. accesses performed this cycle -> memory checker, lockstep queues
+        for (int h = 0; h < N; h++) {
+            for (int k = 0; k < 8; k++) w[k] = gb(top->l1_trace, 256 * h + 32 * k, 32);
+            tr[(size_t)h] = decode_l1(w);
+        }
+        BusTrace bt = decode_bus(top->bus_trace);
+        if (!mc.cycle(cycle, tr)) {
+            std::fprintf(stderr, "\nMEMORY CHECK FAILED: %s\n", mc.error.c_str());
+            status = 6;
+            break;
+        }
+        for (int h = 0; h < N; h++)
+            if (tr[(size_t)h].perf) H.q[(size_t)h].push_back(tr[(size_t)h]);
+
+        // 2. coherence events -> protocol model, log
+        if (opt.model || coh) {
+            std::string err;
+            if (!agree.cycle(cycle, tr, bt, coh, opt.model ? &err : nullptr)) {
+                std::fprintf(stderr, "\nMODEL DISAGREES at cycle %" PRIu64 ": %s\n", cycle, err.c_str());
+                status = 7;
+                break;
             }
         }
-        for (int e = 0; e < RV_HPM_COUNT; e++)
-            if ((top->perf_events >> e) & 1) events[e]++;
+        if (bt.gnt) { bus_cmds[bt.cmd & 7]++; busy = true; }
+        if (busy) bus_busy++;
+        if (bt.resp) busy = false;
+        if (bt.resp && bt.supplied) bus_supplied++;
+
+        // 3. commits -> lockstep
+        for (int h = 0; h < N && status < 0; h++) {
+            if (!gb(top->commit_valid, h, 1)) continue;
+            rv_commit d;
+            std::memset(&d, 0, sizeof d);
+            d.pc = gb(top->commit_pc, 32 * h, 32);
+            d.insn = gb(top->commit_insn, 32 * h, 32);
+            d.trap = (int)gb(top->commit_trap, h, 1);
+            d.cause = d.trap ? gb(top->commit_cause, 32 * h, 32) : 0;
+            d.rd_we = (int)gb(top->commit_rd_we, h, 1);
+            d.rd = d.rd_we ? gb(top->commit_rd, 5 * h, 5) : 0;
+            d.rd_val = d.rd_we ? gb(top->commit_rd_val, 32 * h, 32) : 0;
+            d.mem_we = (int)gb(top->commit_mem_we, h, 1);
+            d.mem_addr = d.mem_we ? gb(top->commit_mem_addr, 32 * h, 32) : 0;
+            d.mem_wmask = d.mem_we ? gb(top->commit_mem_wmask, 4 * h, 4) : 0;
+            uint32_t lanes = 0;
+            for (int b = 0; b < 4; b++)
+                if ((d.mem_wmask >> b) & 1) lanes |= 0xffu << (8 * b);
+            d.mem_wdata = d.mem_we ? (gb(top->commit_mem_wdata, 32 * h, 32) & lanes) : 0;
+            commits++;
+            if (!d.trap) retired[(size_t)h]++;
+            rv_format_commit(&d, line, sizeof line);
+            if (trace) std::fprintf(trace, "%" PRIu64 " h%d %s\n", cycle, h, line);
+            if (!opt.lockstep) continue;
+            rv_iss &m = iss[(size_t)h];
+            rv_commit mc_;
+            m.have_override = 1;
+            m.override_val = d.rd_val;
+            rv_step(&m, &mc_);
+            if (mc_.nondet && mc_.rd_we) mc_.rd_val = d.rd_val;
+            if (m.error) {
+                std::fprintf(stderr, "vsmp: golden model error (hart %d): %s\n", h, m.errmsg);
+                status = 4;
+                break;
+            }
+            bool same = d.pc == mc_.pc && d.insn == mc_.insn && d.trap == mc_.trap && d.cause == mc_.cause &&
+                        d.rd_we == mc_.rd_we && d.rd == mc_.rd && d.rd_val == mc_.rd_val &&
+                        d.mem_we == mc_.mem_we && d.mem_addr == mc_.mem_addr && d.mem_wdata == mc_.mem_wdata &&
+                        d.mem_wmask == mc_.mem_wmask;
+            if (!H.error.empty() || !same) {
+                char ml[320];
+                rv_format_commit(&mc_, ml, sizeof ml);
+                std::fprintf(stderr, "\nLOCKSTEP MISMATCH on hart %d at commit %" PRIu64 ", cycle %" PRIu64 "\n", h,
+                             commits, cycle);
+                if (!H.error.empty()) std::fprintf(stderr, "  %s\n", H.error.c_str());
+                std::fprintf(stderr, "  last matching commits of hart %d:\n", h);
+                for (auto &r : recent[(size_t)h]) std::fprintf(stderr, "    %s\n", r.c_str());
+                std::fprintf(stderr, "  core : %s\n  model: %s\n", line, ml);
+                status = 2;
+                break;
+            }
+            recent[(size_t)h].push_back(line);
+            if (recent[(size_t)h].size() > 8) recent[(size_t)h].erase(recent[(size_t)h].begin());
+        }
+        if (status >= 0) break;
+
+        for (int h = 0; h < N; h++)
+            for (int e = 0; e < RV_HPM_COUNT; e++)
+                if (gb(top->perf_events, RV_HPM_COUNT * h + e, 1)) events[(size_t)(h * RV_HPM_COUNT + e)]++;
         if (top->mmio_we) {
             if (top->mmio_addr == RV_MMIO_CONSOLE) {
                 char ch = (char)(top->mmio_wdata & 0xff);
@@ -217,65 +320,73 @@ int main(int argc, char **argv)
                 exit_cycle = cycle;
             }
         }
-#ifdef HAVE_PIPEVIEW
-        pv.sample(top.get(), cycle, &iss);
-#endif
 
         top->clk = 1;
         top->eval();
         cycle++;
 
         if (exited) {
-            // let the exit store itself commit (and the model reach it too)
-            if (!opt.lockstep || iss.exited || cycle - exit_cycle > 64) {
-                if (opt.lockstep && !iss.exited) {
-                    std::fprintf(stderr, "vsim: the core wrote EXIT but the model did not\n");
+            bool model_exit = false;
+            for (int h = 0; h < N; h++) model_exit = model_exit || iss[(size_t)h].exited;
+            if (!opt.lockstep || model_exit || cycle - exit_cycle > 64) {
+                if (opt.lockstep && !model_exit) {
+                    std::fprintf(stderr, "vsmp: the core wrote EXIT but no model did\n");
                     status = 2;
                 } else {
-                    status = rv_exit_code(exit_value);
+                    prog_code = rv_exit_code(exit_value);
                 }
             }
         } else if (cycle >= opt.max_cycles) {
-            std::fprintf(stderr, "vsim: no exit after %" PRIu64 " cycles\n", cycle);
+            std::fprintf(stderr, "vsmp: no exit after %" PRIu64 " cycles\n", cycle);
             status = 3;
         }
     }
     std::fflush(stdout);
+    if (coh) std::fclose(coh);
     if (trace) std::fclose(trace);
     top->final();
-#ifdef HAVE_PIPEVIEW
-    pv.finish();
-#endif
 
-    if (exited) {
-        if (opt.lockstep && status != 2 && std::string(iss.console ? iss.console : "", iss.console_len) != console) {
-            std::fprintf(stderr, "vsim: console output differs from the golden model\n");
-            status = 2;
-        }
-    }
-
-    double cpi = retired ? (double)cycle / (double)retired : 0.0;
+    uint64_t ret_all = 0;
+    for (int h = 0; h < N; h++) ret_all += retired[(size_t)h];
     if (opt.stats) {
-        std::fprintf(stderr, "cycles %" PRIu64 "  instret %" PRIu64 "  CPI %.4f\n", cycle, retired, cpi);
-        for (int e = 0; e < RV_HPM_COUNT; e++)
-            std::fprintf(stderr, "  %-20s %" PRIu64 "\n", kEventNames[e], events[e]);
+        std::fprintf(stderr, "cycles %" PRIu64 "  harts %d  instret", cycle, N);
+        for (int h = 0; h < N; h++) std::fprintf(stderr, " %" PRIu64, retired[(size_t)h]);
+        std::fprintf(stderr, "\n  bus: BusRd %" PRIu64 "  BusRdX %" PRIu64 "  BusUpgr %" PRIu64 "  BusWB %" PRIu64
+                             "  IFetch %" PRIu64 "  Uncached %" PRIu64 "  supplied-by-cache %" PRIu64 "\n",
+                     bus_cmds[0], bus_cmds[1], bus_cmds[2], bus_cmds[3], bus_cmds[4], bus_cmds[5], bus_supplied);
+        std::fprintf(stderr, "  memory check: %" PRIu64 " accesses, %" PRIu64 " writes, SC %" PRIu64 " ok / %" PRIu64
+                             " failed\n",
+                     mc.checked, mc.writes, mc.sc_ok, mc.sc_fail);
+        if (opt.model) std::fprintf(stderr, "  model agreement: %" PRIu64 " coherence events checked\n", agree.checked);
     }
     if (!opt.json.empty()) {
         FILE *f = std::fopen(opt.json.c_str(), "w");
         if (f) {
-            std::fprintf(f, "{\"cycles\": %" PRIu64 ", \"instret\": %" PRIu64 ", \"commits\": %" PRIu64
-                            ", \"cpi\": %.6f, \"exit\": %d",
-                         cycle, retired, commits, cpi, status);
-            for (int e = 0; e < RV_HPM_COUNT; e++)
-                std::fprintf(f, ", \"%s\": %" PRIu64, kEventNames[e], events[e]);
-            std::fprintf(f, "}\n");
+            std::fprintf(f, "{\"cycles\": %" PRIu64 ", \"harts\": %d, \"instret\": %" PRIu64 ", \"exit\": %d", cycle, N,
+                         ret_all, status >= 0 ? status : prog_code);
+            std::fprintf(f, ", \"bus\": {\"rd\": %" PRIu64 ", \"rdx\": %" PRIu64 ", \"upgr\": %" PRIu64 ", \"wb\": %" PRIu64
+                            ", \"ifetch\": %" PRIu64 ", \"uncached\": %" PRIu64 ", \"supplied\": %" PRIu64
+                            ", \"busy_cycles\": %" PRIu64 "}",
+                         bus_cmds[0], bus_cmds[1], bus_cmds[2], bus_cmds[3], bus_cmds[4], bus_cmds[5], bus_supplied,
+                         bus_busy);
+            std::fprintf(f, ", \"memcheck\": {\"accesses\": %" PRIu64 ", \"writes\": %" PRIu64 ", \"sc_ok\": %" PRIu64
+                            ", \"sc_fail\": %" PRIu64 "}, \"model_events\": %" PRIu64,
+                         mc.checked, mc.writes, mc.sc_ok, mc.sc_fail, agree.checked);
+            std::fprintf(f, ", \"per_hart\": [");
+            for (int h = 0; h < N; h++) {
+                std::fprintf(f, "%s{\"instret\": %" PRIu64, h ? ", " : "", retired[(size_t)h]);
+                for (int e = 0; e < RV_HPM_COUNT; e++)
+                    std::fprintf(f, ", \"%s\": %" PRIu64, kEventNames[e], events[(size_t)(h * RV_HPM_COUNT + e)]);
+                std::fprintf(f, "}");
+            }
+            std::fprintf(f, "]}\n");
             std::fclose(f);
         }
     }
-    rv_iss_free(&iss);
-    if (!exited || status == 2) return status;
-    if (status != 0) {
-        std::fprintf(stderr, "vsim: program exit code %d\n", status);
+    for (int h = N - 1; h >= 0; h--) rv_iss_free(&iss[(size_t)h]);
+    if (status >= 0) return status;
+    if (prog_code != 0) {
+        std::fprintf(stderr, "vsmp: program exit code %d\n", prog_code);
         return 1;
     }
     return 0;

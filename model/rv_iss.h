@@ -1,7 +1,15 @@
-/* rv_iss: the golden model.  An instruction-set simulator for RV32IM +
- * Zicsr + Zifencei, optionally with F and D (has_fpu), machine mode only, written to the RISC-V
- * specifications and nothing else.  Both RTL cores are checked against it,
- * instruction by instruction.
+/* rv_iss: the golden model.  An instruction-set simulator for RV32IMA +
+ * Zicsr + Zifencei, machine mode only, written to the RISC-V specifications
+ * and nothing else.  (The F and D code of rv32-pipeline is still here behind
+ * has_fpu; the multicore is RV32IMA, so it stays off.)  Every hart of the
+ * RTL is checked against its own instance, instruction by instruction.
+ *
+ * Several harts: give each its own rv_iss (rv_iss_init_shared shares the
+ * RAM image) and set data_hook.  Data accesses to RAM then go through the
+ * hook, which returns the value the hardware read: with several harts the
+ * value a load returns depends on timing, so it is the hardware's, and the
+ * harness checks separately that the hardware's value was legal (see
+ * sim/memcheck.h).
  *
  * One call to rv_step() executes one instruction (or takes one exception) and
  * describes its architectural effect in an rv_commit record, the same record
@@ -61,9 +69,21 @@ typedef struct {
     int have_override;
     uint32_t override_val;
     uint64_t steps;
+    /* harts */
+    uint32_t hartid, nharts;
+    int resv_valid;        /* LR reservation (16-byte granule, as the RTL's line) */
+    uint32_t resv_addr;
+    int shared_ram;        /* ram belongs to another instance */
+    /* data accesses to RAM; kind: 0 load, 1 store, 2 LR, 3 SC, 4 AMO.  Returns
+     * the old value at addr (size bytes); for SC sets *sc_ok. */
+    uint32_t (*data_hook)(void *ctx, uint32_t hart, int kind, uint32_t addr, int size, uint32_t wvalue,
+                          int *sc_ok);
+    void *hook_ctx;
 } rv_iss;
 
 int  rv_iss_init(rv_iss *s);
+/* another hart on the same RAM as `owner` (owner must outlive it) */
+void rv_iss_init_shared(rv_iss *s, const rv_iss *owner, uint32_t hartid);
 void rv_iss_free(rv_iss *s);
 /* Load an ELF32 RISC-V executable into RAM.  Returns 0 or -1 (message in errmsg). */
 int  rv_iss_load_elf(rv_iss *s, const char *path);

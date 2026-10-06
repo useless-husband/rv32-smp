@@ -14,7 +14,9 @@ enum {
     CAUSE_ILLEGAL = 2,
     CAUSE_BREAKPOINT = 3,
     CAUSE_MISALIGNED_LOAD = 4,
+    CAUSE_LOAD_FAULT = 5,
     CAUSE_MISALIGNED_STORE = 6,
+    CAUSE_STORE_FAULT = 7,
     CAUSE_ECALL_M = 11,
 };
 
@@ -25,12 +27,24 @@ int rv_iss_init(rv_iss *s)
     if (!s->ram)
         return -1;
     s->pc = RV_RESET_PC;
+    s->nharts = 1;
     return 0;
+}
+
+void rv_iss_init_shared(rv_iss *s, const rv_iss *owner, uint32_t hartid)
+{
+    memset(s, 0, sizeof *s);
+    s->ram = owner->ram;
+    s->shared_ram = 1;
+    s->pc = RV_RESET_PC;
+    s->hartid = hartid;
+    s->nharts = owner->nharts;
 }
 
 void rv_iss_free(rv_iss *s)
 {
-    free(s->ram);
+    if (!s->shared_ram)
+        free(s->ram);
     free(s->console);
     s->ram = NULL;
     s->console = NULL;
@@ -138,7 +152,19 @@ static uint32_t load(rv_iss *s, uint32_t a, int size)
     }
     if (!in_mmio(a))
         fail(s, "load", a);
-    return 0; /* I/O registers read as zero */
+    if (a == RV_MMIO_NHARTS && size == 4)
+        return s->nharts;
+    return 0; /* other I/O registers read as zero */
+}
+
+/* a data access to RAM: through the hook when there are other harts */
+static uint32_t dload(rv_iss *s, int kind, uint32_t a, int size, uint32_t wv, int *sc_ok)
+{
+    if (s->data_hook && in_ram(a, (uint32_t)size))
+        return s->data_hook(s->hook_ctx, s->hartid, kind, a, size, wv, sc_ok);
+    if (kind == 3)
+        *sc_ok = s->resv_valid && s->resv_addr == (a & ~15u);
+    return load(s, a, size);
 }
 
 static void console_put(rv_iss *s, char ch)
@@ -209,14 +235,15 @@ static int csr_read(rv_iss *s, uint32_t a, uint32_t *v)
     case 0x300: /* SD (bit 31) summarises FS == dirty */
         *v = s->mie_bit << 3 | s->mpie_bit << 7 | 3u << 11 | s->fs << 13 | (uint32_t)(s->fs == 3) << 31;
         return 0;
-    case 0x301: *v = s->has_fpu ? 0x40001128u : 0x40001100u; return 0; /* MXL=32, I, M (, F, D) */
+    case 0x301: *v = s->has_fpu ? 0x40001129u : 0x40001101u; return 0; /* MXL=32, I, M, A (, F, D) */
     case 0x304: case 0x344: *v = 0; return 0; /* mie, mip: no interrupts */
     case 0x305: *v = s->mtvec; return 0;
     case 0x340: *v = s->mscratch; return 0;
     case 0x341: *v = s->mepc; return 0;
     case 0x342: *v = s->mcause; return 0;
     case 0x343: *v = s->mtval; return 0;
-    case 0xF11: case 0xF12: case 0xF13: case 0xF14: case 0xF15: *v = 0; return 0;
+    case 0xF14: *v = s->hartid; return 0;
+    case 0xF11: case 0xF12: case 0xF13: case 0xF15: *v = 0; return 0;
     }
     if ((a & 0xf00) == 0xB00 || user) {
         uint32_t hi = a & 0x80;
@@ -452,7 +479,7 @@ void rv_step(rv_iss *s, rv_commit *c)
         int size = (f3 & 3) == 0 ? 1 : (f3 & 3) == 1 ? 2 : 4;
         if (f3 == 3 || f3 > 5) goto illegal;
         if (addr & (uint32_t)(size - 1)) { trap(s, c, CAUSE_MISALIGNED_LOAD, addr); return; }
-        res = load(s, addr, size);
+        res = dload(s, 0, addr, size, 0, NULL);
         if (f3 == 0) res = (uint32_t)sext(res, 8);
         if (f3 == 1) res = (uint32_t)sext(res, 16);
         wb = 1; break;
@@ -462,8 +489,47 @@ void rv_step(rv_iss *s, rv_commit *c)
         int size = 1 << f3;
         if (f3 > 2) goto illegal;
         if (addr & (uint32_t)(size - 1)) { trap(s, c, CAUSE_MISALIGNED_STORE, addr); return; }
+        if (s->data_hook && in_ram(addr, (uint32_t)size))
+            (void)dload(s, 1, addr, size, b, NULL);
         store(s, c, addr, b, size);
         break;
+    }
+    case 0x2f: {                                                        /* A: LR, SC, AMOs */
+        uint32_t f5 = in >> 27, old, nv;
+        int ok = 0, lr = f5 == 2;
+        if (f3 != 2 || (lr && r2 != 0)) goto illegal;
+        if (f5 != 0 && f5 != 1 && f5 != 2 && f5 != 3 && f5 != 4 && f5 != 8 && f5 != 12 && f5 != 16 &&
+            f5 != 20 && f5 != 24 && f5 != 28)
+            goto illegal;
+        if (a & 3) { trap(s, c, lr ? CAUSE_MISALIGNED_LOAD : CAUSE_MISALIGNED_STORE, a); return; }
+        if (!(a & 0x80000000u)) { trap(s, c, lr ? CAUSE_LOAD_FAULT : CAUSE_STORE_FAULT, a); return; }
+        if (lr) {
+            res = dload(s, 2, a, 4, 0, NULL);
+            s->resv_valid = 1;
+            s->resv_addr = a & ~15u;
+        } else if (f5 == 3) {
+            (void)dload(s, 3, a, 4, b, &ok);
+            s->resv_valid = 0;
+            if (ok)
+                store(s, c, a, b, 4);
+            res = !ok;
+        } else {
+            old = dload(s, 4, a, 4, b, NULL);
+            switch (f5) {
+            case 1: nv = b; break;
+            case 0: nv = old + b; break;
+            case 4: nv = old ^ b; break;
+            case 12: nv = old & b; break;
+            case 8: nv = old | b; break;
+            case 16: nv = (int32_t)old < (int32_t)b ? old : b; break;
+            case 20: nv = (int32_t)old > (int32_t)b ? old : b; break;
+            case 24: nv = old < b ? old : b; break;
+            default: nv = old > b ? old : b; break;
+            }
+            store(s, c, a, nv, 4);
+            res = old;
+        }
+        wb = 1; break;
     }
     case 0x07: {                                                        /* FLW, FLD */
         uint32_t addr = a + (uint32_t)imm_i;
@@ -524,7 +590,7 @@ void rv_step(rv_iss *s, rv_commit *c)
         wb = 1; break;
     case 0x0f:                                                          /* FENCE, FENCE.I */
         if (f3 > 1) goto illegal;
-        break; /* one hart, no caches visible to the model: both are no-ops */
+        break; /* the model performs every access at once, in program order: both are no-ops */
     case 0x73:                                                          /* SYSTEM */
         if (f3 == 0) {
             if (in == 0x00000073u) { trap(s, c, CAUSE_ECALL_M, 0); return; }

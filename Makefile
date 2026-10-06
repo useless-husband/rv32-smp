@@ -187,4 +187,20 @@ synth: loopcheck
 	for n in 1 2 4; do 	  $(YOSYS) -q -l build/synth/area$$n.log -p "read_verilog -sv -Irtl $(SYNTH_RTL); 	    chparam -set NHARTS $$n smp_core; synth_xilinx -family xc7 -top smp_core -flatten; 	    tee -q -o build/synth/stat$$n.json stat -json" > /dev/null 2>&1 || { tail -20 build/synth/area$$n.log; exit 1; }; 	  $(YOSYS) -q -l build/synth/depth$$n.log -p "read_verilog -sv -Irtl $(SYNTH_RTL); 	    chparam -set NHARTS $$n smp_core; synth_xilinx -family xc7 -top smp_core -flatten -nodsp -nolutram; 	    delete t:FD* t:RAMB*; ltp -noff" > /dev/null 2>&1 || { tail -20 build/synth/depth$$n.log; exit 1; }; 	done
 	$(PYTHON) tools/synth_report.py
 
+# --------------------------------------------------------------- report, demo
+.PHONY: museum report
+museum: build/mc $(BUG_SIMS) sw
+	@mkdir -p build/museum
+	./build/mc --all > build/mc.md
+	$(PYTHON) tools/museum_data.py
+
+report: museum bench litmus
+	$(PYTHON) tools/report.py
+	@echo "wrote docs/report.html"
+
+demo: $(SIMS) sw
+	$(PYTHON) tools/bench.py | sed -n '1,40p'
+	@echo; echo "one bug-museum case (lost upgrade) on the buggy 2-hart build:"
+	-./build/vsmp2-bug1 --model --max-cycles 4000000 build/sw/lost_upgrade.elf
+
 test: lint loopcheck iss-test mc system

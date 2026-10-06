@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rv32-smp report</title>
+<style>
+:root {
+  --bg: #ffffff; --fg: #1a1a1a; --muted: #5a5a5a; --line: #d9d9d9; --panel: #f5f5f3;
+  --accent: #335; --i:#cfcfcf; --s:#7fa8d0; --e:#e0b050; --m:#c2614f; --ok:#2f7d42; --bad:#b23b2e;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg:#15171a; --fg:#e8e8e6; --muted:#9aa0a6; --line:#33373c; --panel:#1d2024;
+    --accent:#9db7e0; --i:#3a3f45; --s:#4a6fa0; --e:#9c7a2e; --m:#9c4436; --ok:#5bbd73; --bad:#e06a5c;
+  }
+}
+:root[data-theme="dark"] {
+  --bg:#15171a; --fg:#e8e8e6; --muted:#9aa0a6; --line:#33373c; --panel:#1d2024;
+  --accent:#9db7e0; --i:#3a3f45; --s:#4a6fa0; --e:#9c7a2e; --m:#9c4436; --ok:#5bbd73; --bad:#e06a5c;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--fg); margin: 0;
+  font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+main { max-width: 960px; margin: 0 auto; padding: 24px 16px 80px; }
+h1 { font-size: 24px; margin: 0 0 4px; }
+h2 { font-size: 19px; margin: 40px 0 8px; padding-top: 10px; border-top: 1px solid var(--line); }
+h3 { font-size: 16px; margin: 22px 0 6px; }
+p { margin: 8px 0; } .muted { color: var(--muted); }
+code, .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 13px; }
+table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 14px; }
+th, td { border: 1px solid var(--line); padding: 5px 9px; text-align: left; }
+th { background: var(--panel); font-weight: 600; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 14px 0 6px; }
+.tab { padding: 6px 12px; border: 1px solid var(--line); background: var(--panel); cursor: pointer;
+  border-radius: 4px; font-size: 13px; color: var(--fg); }
+.tab[aria-selected="true"] { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+.bug { border: 1px solid var(--line); border-radius: 6px; padding: 14px 16px; margin: 10px 0; }
+.expl { background: var(--panel); border-left: 3px solid var(--accent); padding: 8px 12px; margin: 10px 0; }
+.timeline { overflow-x: auto; }
+.tl { border-collapse: collapse; font-size: 12.5px; min-width: 100%; }
+.tl th, .tl td { border: 1px solid var(--line); padding: 4px 7px; white-space: nowrap; }
+.tl td.act { white-space: normal; max-width: 360px; }
+.cell { display: inline-flex; gap: 4px; align-items: center; }
+.st { display: inline-block; min-width: 20px; text-align: center; border-radius: 3px; padding: 0 5px;
+  font-weight: 700; color: #111; }
+.st.I { background: var(--i); color: var(--muted); } .st.S { background: var(--s); color:#071; }
+.st.E { background: var(--e); } .st.M { background: var(--m); color:#fff; }
+.stale { outline: 2px dashed var(--bad); }
+.badge { display:inline-block; padding: 1px 7px; border-radius: 3px; font-size: 12px; font-weight: 600; }
+.badge.bad { background: var(--bad); color:#fff; } .badge.ok { background: var(--ok); color:#fff; }
+.bar { background: var(--accent); height: 16px; border-radius: 2px; }
+.barrow { display:flex; align-items:center; gap:8px; margin:3px 0; }
+.barrow .lbl { width: 64px; } .barrow .val { width: 120px; }
+.legend { display:flex; gap:14px; flex-wrap:wrap; margin: 6px 0; font-size:13px; }
+details { margin: 8px 0; } summary { cursor: pointer; font-weight:600; }
+.evlog { font-size:12px; margin:0; }
+.evlog div { padding:1px 0; border-bottom:1px solid var(--line); }
+</style>
+</head>
+<body>
+<main>
+<h1>rv32-smp &mdash; a cache-coherent multicore RISC-V</h1>
+<p class="muted">An N-core RV32IMA built from a single-core pipeline, with private MESI L1 caches on a
+snooping bus. The coherence protocol is verified three ways that agree: an exhaustive model check,
+a golden memory-order checker on the RTL, and step-by-step agreement between the RTL and an abstract
+model. Known protocol bugs are reproduced end to end below. Everything is simulation plus a Yosys
+estimate; no FPGA board.</p>
+
+<h2>Results at a glance</h2>
+<div id="glance"></div>
+
+<h2>Model checking the protocol</h2>
+<p>An explicit-state search over every reachable state of the abstract protocol (states counted after
+symmetry reduction over caches and addresses). It checks single-writer/multiple-reader, the data-value
+invariant (every read returns the latest write in coherence order) and deadlock freedom.</p>
+<div id="mc_correct"></div>
+<p>Each deliberately broken variant (the "bug museum") has a shortest counterexample:</p>
+<div id="mc_bugs"></div>
+
+<h2>Bug museum</h2>
+<p>Four-plus classic coherence and atomics bugs, each a switchable RTL variant. For every one: the
+model checker's shortest counterexample as a timeline, the plain-language reason, and the same bug
+reproduced in the RTL by a directed two-hart program (caught by the memory checker, the model, or a
+deadlock budget).</p>
+<div class="legend">
+  <span class="cell"><span class="st I">I</span> invalid</span>
+  <span class="cell"><span class="st S">S</span> shared</span>
+  <span class="cell"><span class="st E">E</span> exclusive</span>
+  <span class="cell"><span class="st M">M</span> modified</span>
+  <span class="cell"><span class="st S stale">S</span> dashed = holds a stale value</span>
+</div>
+<div class="tabs" id="bugtabs"></div>
+<div id="bugpanel"></div>
+
+<h2>Speed-up and coherence traffic</h2>
+<h3>Mandelbrot, rows split across harts (little sharing)</h3>
+<div id="mandel"></div>
+<div id="mandelbar"></div>
+<h3>Shared histogram (every bucket contended)</h3>
+<div id="hist"></div>
+<h3>False sharing and its fix</h3>
+<p>Each hart increments its own counter; in the packed layout the counters share one cache line and
+ping-pong, in the padded layout each sits on its own line. The fix is <b id="fs"></b> faster.</p>
+
+<h2>Litmus tests vs the reference RVWMO model</h2>
+<p>Each test runs many times with the timing perturbed; every outcome the core produces is checked
+against the reference model's verdict shipped with litmus-tests-riscv. The core performs memory
+accesses in program order at one point, so it is sequentially consistent: it never shows a relaxed
+outcome, even where RVWMO allows one.</p>
+<div id="litmus"></div>
+
+<h2>Synthesis estimate (Yosys, Spartan-7 XC7S50)</h2>
+<p>No place and route; the delay is a rough logic-level estimate, not sign-off.</p>
+<div id="synth"></div>
+
+<p class="muted" style="margin-top:40px">Generated by <code>make report</code> from the build
+artifacts. Numbers measured on this machine.</p>
+</main>
+<script id="data" type="application/json">{"mc_correct":[],"mc_bugs":[],"mandel":[["harts","cycles","speed-up","checksum","BusRd","BusRdX","BusUpgr","supplied by a cache"],["1","1,692,930","1.00x","70288","9","37","0","0"],["2","852,072","1.99x","70288","26","2233","10","2209"],["4","429,560","3.94x","70288","52","3093","21","3077"]],"hist":[["harts","cycles","speed-up","bucket total"],["1","32,988","1.00x","4096"],["2","22,667","1.46x","4096"],["4","16,346","2.02x","4096"]],"false_sharing":"2.99x","synth":[["harts","LUTs","(% of 32,600)","flip-flops","CARRY4","block RAM (36 Kb)","DSP","logic depth","est. longest path"],["1","10,843","33.3%","4,574","436","6","4","29 levels","17.4 ns"],["2","21,668","66.5%","8,839","879","13","8","30 levels","18.0 ns"],["4","43,282","132.8%","17,367","1,757","26","16","30 levels","18.0 ns"]],"litmus":{"harts":4,"runs_per_test":3000,"tests":[{"name":"MP","threads":2,"ran":true,"runs":3000,"relaxed":0},{"name":"MP+fence.rw.rws","threads":2,"ran":true,"runs":3000,"relaxed":0},{"name":"SB","threads":2,"ran":true,"runs":3000,"relaxed":0},{"name":"SB+fence.rw.rws","threads":2,"ran":true,"runs":3000,"relaxed":0},{"name":"LB","threads":2,"ran":true,"runs":3000,"relaxed":0},{"name":"LB+fence.rw.rws","threads":2,"ran":true,"runs":3000,"relaxed":0},{"name":"2+2W","threads":2,"ran":true,"runs":3000,"relaxed":0},{"name":"2+2W+fence.rw.rws","threads":2,"ran":true,"runs":3000,"relaxed":0},{"name":"IRIW+fence.rw.rws","threads":4,"ran":true,"runs":3000,"relaxed":0},{"name":"AMO-FENCE","threads":2,"ran":true,"runs":3000,"relaxed":0}]},"museum":{"bugs":[{"id":1,"prog":"lost_upgrade","title":"Lost upgrade race","explanation":"Two caches hold a line Shared and both write it. Each asks the bus to upgrade (BusUpgr, no data). The bus serves one; the other loses its Shared copy to that invalidation while it waits. The correct cache turns its upgrade into a BusRdX and re-reads the winner's data; the broken one upgrades a copy it no longer has, so the winner's write is lost.","model":{"bug":1,"name":"lost upgrade","caches":2,"addresses":1,"observable":true,"states":450,"violation":"a read returned a stale value","steps":[{"action":"initial state","caches":[{"lines":[{"st":"I","fresh":0}],"pend":"","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"","wb":"","resv":""}],"mem":[1],"bus":""},{"action":"cache 0: load A misses, waits for BusRd","caches":[{"lines":[{"st":"I","fresh":0}],"pend":"load A via BusRd","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"","wb":"","resv":""}],"mem":[1],"bus":""},{"action":"bus: grants cache 0 BusRd A","caches":[{"lines":[{"st":"I","fresh":0}],"pend":"load A via BusRd","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"","wb":"","resv":""}],"mem":[1],"bus":"cache 0 BusRd A"},{"action":"cache 1: load A misses, waits for BusRd","caches":[{"lines":[{"st":"I","fresh":0}],"pend":"load A via BusRd","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"load A via BusRd","wb":"","resv":""}],"mem":[1],"bus":"cache 0 BusRd A"},{"action":"cache 1: answers the snoop (I -> I)","caches":[{"lines":[{"st":"I","fresh":0}],"pend":"load A via BusRd","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"load A via BusRd","wb":"","resv":""}],"mem":[1],"bus":"cache 0 BusRd A"},{"action":"cache 0: fill done, A is now E, performs its load","caches":[{"lines":[{"st":"E","fresh":1}],"pend":"","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"load A via BusRd","wb":"","resv":""}],"mem":[1],"bus":""},{"action":"bus: grants cache 1 BusRd A","caches":[{"lines":[{"st":"E","fresh":1}],"pend":"","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"load A via BusRd","wb":"","resv":""}],"mem":[1],"bus":"cache 1 BusRd A"},{"action":"cache 0: answers the snoop (E -> S)","caches":[{"lines":[{"st":"S","fresh":1}],"pend":"","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"load A via BusRd","wb":"","resv":""}],"mem":[1],"bus":"cache 1 BusRd A"},{"action":"cache 0: store A misses, waits for BusUpgr","caches":[{"lines":[{"st":"S","fresh":1}],"pend":"store A via BusUpgr","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"load A via BusRd","wb":"","resv":""}],"mem":[1],"bus":"cache 1 BusRd A"},{"action":"cache 1: fill done, A is now S, performs its load","caches":[{"lines":[{"st":"S","fresh":1}],"pend":"store A via BusUpgr","wb":"","resv":""},{"lines":[{"st":"S","fresh":1}],"pend":"","wb":"","resv":""}],"mem":[1],"bus":""},{"action":"bus: grants cache 0 BusUpgr A","caches":[{"lines":[{"st":"S","fresh":1}],"pend":"store A via BusUpgr","wb":"","resv":""},{"lines":[{"st":"S","fresh":1}],"pend":"","wb":"","resv":""}],"mem":[1],"bus":"cache 0 BusUpgr A"},{"action":"cache 1: lr A misses, waits for BusUpgr","caches":[{"lines":[{"st":"S","fresh":1}],"pend":"store A via BusUpgr","wb":"","resv":""},{"lines":[{"st":"S","fresh":1}],"pend":"lr A via BusUpgr","wb":"","resv":""}],"mem":[1],"bus":"cache 0 BusUpgr A"},{"action":"cache 1: answers the snoop (S -> I)","caches":[{"lines":[{"st":"S","fresh":1}],"pend":"store A via BusUpgr","wb":"","resv":""},{"lines":[{"st":"I","fresh":1}],"pend":"lr A via BusUpgr","wb":"","resv":""}],"mem":[1],"bus":"cache 0 BusUpgr A"},{"action":"cache 0: fill done, A is now M, performs its store","caches":[{"lines":[{"st":"M","fresh":1}],"pend":"","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"lr A via BusUpgr","wb":"","resv":""}],"mem":[0],"bus":""},{"action":"bus: grants cache 1 BusUpgr A","caches":[{"lines":[{"st":"M","fresh":1}],"pend":"","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"lr A via BusUpgr","wb":"","resv":""}],"mem":[0],"bus":"cache 1 BusUpgr A"},{"action":"cache 0: answers the snoop (M -> I)","caches":[{"lines":[{"st":"I","fresh":1}],"pend":"","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"lr A via BusUpgr","wb":"","resv":""}],"mem":[0],"bus":"cache 1 BusUpgr A"},{"action":"cache 1: fill done, A is now M, performs its lr","caches":[{"lines":[{"st":"I","fresh":1}],"pend":"","wb":"","resv":""},{"lines":[{"st":"M","fresh":0}],"pend":"","wb":"","resv":"A, lock-out"}],"mem":[0],"bus":""}]},"rtl":{"events":[{"c":7233,"h":1,"e":"miss","line":"80001740","op":"load","cmd":"BusRd","victim":"-","vst":"-"},{"c":7234,"h":1,"e":"grant","line":"80001740","cmd":"BusRd"},{"c":7237,"h":0,"e":"snoop","line":"80001740","cmd":"BusRd","from":"M","to":"S","supply":1,"wb":0},{"c":7238,"h":0,"e":"miss","line":"80001740","op":"store","cmd":"BusUpgr","victim":"-","vst":"-"},{"c":7249,"h":1,"e":"fill","line":"80001740","cmd":"BusRd","op":"load","to":"S","sc_ok":0},{"c":7250,"h":0,"e":"grant","line":"80001740","cmd":"BusUpgr"},{"c":7252,"h":1,"e":"hit","line":"80001740","op":"load","from":"S","to":"S","sc_ok":0},{"c":7253,"h":1,"e":"snoop","line":"80001740","cmd":"BusUpgr","from":"S","to":"I","supply":0,"wb":0},{"c":7254,"h":0,"e":"fill","line":"80001740","cmd":"BusUpgr","op":"store","to":"M","sc_ok":0},{"c":7255,"h":1,"e":"miss","line":"80001740","op":"load","cmd":"BusRd","victim":"-","vst":"-"},{"c":7256,"h":0,"e":"hit","line":"80001740","op":"store","from":"M","to":"M","sc_ok":0},{"c":7256,"h":1,"e":"grant","line":"80001740","cmd":"BusRd"},{"c":7259,"h":0,"e":"snoop","line":"80001740","cmd":"BusRd","from":"M","to":"S","supply":1,"wb":0},{"c":7260,"h":0,"e":"hit","line":"80001750","op":"load","from":"M","to":"M","sc_ok":0}],"reason":"MEMORY CHECK FAILED: cycle 7263: hart 0 load at 80001754 saw 00000018, but the latest write in perform order left 00000019 (hart 1 at cycle 7213)","exit":6}},{"id":2,"prog":"wb_race","title":"Request crossing a write-back","explanation":"A dirty line is evicted into the one-entry write-back buffer and the buffer is drained to memory only after the new line is filled. If another cache asks for that line while it still sits in the buffer, the buffer holds the only current copy and must answer. The broken cache ignores its buffer, so the requester reads the stale value from memory.","model":{"bug":2,"name":"write-back buffer not snooped","caches":2,"addresses":2,"observable":true,"states":1641,"violation":"a read returned a stale value","steps":[{"action":"initial state","caches":[{"lines":[{"st":"I","fresh":0},{"st":"I","fresh":0}],"pend":"","wb":"","resv":""},{"lines":[{"st":"I","fresh":0},{"st":"I","fresh":0}],"pend":"","wb":"","resv":""}],"mem":[1,1],"bus":""},{"action":"cache 0: load A misses, waits for BusRd","caches":[{"lines":[{"st":"I","fresh":0},{"st":"I","fresh":0}],"pend":"load A via BusRd","wb":"","resv":""},{"lines":[{"st":"I","fresh":0},{"st":"I","fresh":0}],"pend":"","wb":"","resv":""}],"mem":[1,1],"bus":""},{"action":"cache 1: store A misses, waits for BusRdX","caches":[{"lines":[{"st":"I","fresh":0},{"st":"I","fresh":0}],"pend":"load A via BusRd","wb":"","resv":""},{"lines":[{"st":"I","fresh":0},{"st":"I","fresh":0}],"pend":"store A via BusRdX","wb":"","resv":""}],"mem":[1,1],"bus":""},{"action":"bus: grants cache 1 BusRdX A","caches":[{"lines":[{"st":"I","fresh":0},{"st":"I","fresh":0}],"pend":"load A via BusRd","wb":"","resv":""},{"lines":[{"st":"I","fresh":0},{"st":"I","fresh":0}],"pend":"store A via BusRdX","wb":"","resv":""}],"mem":[1,1],"bus":"cache 1 BusRdX A"},{"action":"cache 0: answers the snoop (I -> I)","caches":[{"lines":[{"st":"I","fresh":0},{"st":"I","fresh":0}],"pend":"load A via BusRd","wb":"","resv":""},{"lines":[{"st":"I","fresh":0},{"st":"I","fresh":0}],"pend":"store A via BusRdX","wb":"","resv":""}],"mem":[1,1],"bus":"cache 1 BusRdX A"},{"action":"cache 1: fill done, A is now M, performs its store","caches":[{"lines":[{"st":"I","fresh":0},{"st":"I","fresh":0}],"pend":"load A via BusRd","wb":"","resv":""},{"lines":[{"st":"M","fresh":1},{"st":"I","fresh":0}],"pend":"","wb":"","resv":""}],"mem":[0,1],"bus":""},{"action":"bus: grants cache 0 BusRd A","caches":[{"lines":[{"st":"I","fresh":0},{"st":"I","fresh":0}],"pend":"load A via BusRd","wb":"","resv":""},{"lines":[{"st":"M","fresh":1},{"st":"I","fresh":0}],"pend":"","wb":"","resv":""}],"mem":[0,1],"bus":"cache 0 BusRd A"},{"action":"cache 1: load B misses, waits for BusRd; evicts A (M -> write-back buffer)","caches":[{"lines":[{"st":"I","fresh":0},{"st":"I","fresh":0}],"pend":"load A via BusRd","wb":"","resv":""},{"lines":[{"st":"I","fresh":1},{"st":"I","fresh":0}],"pend":"load B via BusRd","wb":"A (current)","resv":""}],"mem":[0,1],"bus":"cache 0 BusRd A"},{"action":"cache 1: answers the snoop (I -> I)","caches":[{"lines":[{"st":"I","fresh":0},{"st":"I","fresh":0}],"pend":"load A via BusRd","wb":"","resv":""},{"lines":[{"st":"I","fresh":1},{"st":"I","fresh":0}],"pend":"load B via BusRd","wb":"A (current)","resv":""}],"mem":[0,1],"bus":"cache 0 BusRd A"},{"action":"cache 0: fill done, A is now E, performs its load","caches":[{"lines":[{"st":"E","fresh":0},{"st":"I","fresh":0}],"pend":"","wb":"","resv":""},{"lines":[{"st":"I","fresh":1},{"st":"I","fresh":0}],"pend":"load B via BusRd","wb":"A (current)","resv":""}],"mem":[0,1],"bus":""}]},"rtl":{"events":[{"c":18493,"h":0,"e":"evict","line":"80002000","from":"M","wb":1},{"c":18494,"h":0,"e":"grant","line":"80003000","cmd":"BusRd"},{"c":18495,"h":1,"e":"hit","line":"800fbfc0","op":"store","from":"M","to":"M","sc_ok":0},{"c":18496,"h":1,"e":"hit","line":"800fbfc0","op":"load","from":"M","to":"M","sc_ok":0},{"c":18497,"h":1,"e":"snoop","line":"80003000","cmd":"BusRd","from":"I","to":"I","supply":0,"wb":0},{"c":18501,"h":1,"e":"hit","line":"800fbfc0","op":"load","from":"M","to":"M","sc_ok":0},{"c":18504,"h":1,"e":"hit","line":"800fbfc0","op":"store","from":"M","to":"M","sc_ok":0},{"c":18505,"h":1,"e":"hit","line":"800fbfc0","op":"load","from":"M","to":"M","sc_ok":0},{"c":18508,"h":1,"e":"miss","line":"80002000","op":"load","cmd":"BusRd","victim":"-","vst":"-"},{"c":18509,"h":0,"e":"fill","line":"80003000","cmd":"BusRd","op":"load","to":"E","sc_ok":0},{"c":18510,"h":1,"e":"grant","line":"80002000","cmd":"BusRd"},{"c":18513,"h":0,"e":"snoop","line":"80002000","cmd":"BusRd","from":"I","to":"I","supply":0,"wb":0},{"c":18514,"h":0,"e":"hit","line":"800fffa0","op":"load","from":"M","to":"M","sc_ok":0},{"c":18517,"h":0,"e":"hit","line":"800fffa0","op":"store","from":"M","to":"M","sc_ok":0}],"reason":"MEMORY CHECK FAILED: cycle 18525: hart 1 load at 80002000 saw 00000001, but the latest write in perform order left 00000002 (hart 0 at cycle 18422)","exit":6}},{"id":3,"prog":"lrsc_clear","title":"Reservation not cleared by a remote store","explanation":"A hart does LR on a line, then another hart writes it, then the first hart does SC. The SC must fail: the value changed under it. The broken cache does not clear the reservation when a remote store invalidates the line, so the SC succeeds and silently overwrites the other hart's store - the atomicity LR/SC promises is gone.","model":{"bug":3,"name":"LR reservation survives a remote write","caches":2,"addresses":1,"observable":true,"states":443,"violation":"SC succeeded after a remote write","steps":[{"action":"initial state","caches":[{"lines":[{"st":"I","fresh":0}],"pend":"","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"","wb":"","resv":""}],"mem":[1],"bus":""},{"action":"cache 0: store A misses, waits for BusRdX","caches":[{"lines":[{"st":"I","fresh":0}],"pend":"store A via BusRdX","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"","wb":"","resv":""}],"mem":[1],"bus":""},{"action":"cache 1: lr A misses, waits for BusRdX","caches":[{"lines":[{"st":"I","fresh":0}],"pend":"store A via BusRdX","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"lr A via BusRdX","wb":"","resv":""}],"mem":[1],"bus":""},{"action":"bus: grants cache 1 BusRdX A","caches":[{"lines":[{"st":"I","fresh":0}],"pend":"store A via BusRdX","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"lr A via BusRdX","wb":"","resv":""}],"mem":[1],"bus":"cache 1 BusRdX A"},{"action":"cache 0: answers the snoop (I -> I)","caches":[{"lines":[{"st":"I","fresh":0}],"pend":"store A via BusRdX","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"lr A via BusRdX","wb":"","resv":""}],"mem":[1],"bus":"cache 1 BusRdX A"},{"action":"cache 1: fill done, A is now M, performs its lr","caches":[{"lines":[{"st":"I","fresh":0}],"pend":"store A via BusRdX","wb":"","resv":""},{"lines":[{"st":"M","fresh":1}],"pend":"","wb":"","resv":"A, lock-out"}],"mem":[1],"bus":""},{"action":"cache 1: LR lock-out window closes","caches":[{"lines":[{"st":"I","fresh":0}],"pend":"store A via BusRdX","wb":"","resv":""},{"lines":[{"st":"M","fresh":1}],"pend":"","wb":"","resv":"A"}],"mem":[1],"bus":""},{"action":"bus: grants cache 0 BusRdX A","caches":[{"lines":[{"st":"I","fresh":0}],"pend":"store A via BusRdX","wb":"","resv":""},{"lines":[{"st":"M","fresh":1}],"pend":"","wb":"","resv":"A"}],"mem":[1],"bus":"cache 0 BusRdX A"},{"action":"cache 1: answers the snoop (M -> I), supplies the line","caches":[{"lines":[{"st":"I","fresh":0}],"pend":"store A via BusRdX","wb":"","resv":""},{"lines":[{"st":"I","fresh":1}],"pend":"","wb":"","resv":"A"}],"mem":[1],"bus":"cache 0 BusRdX A"},{"action":"cache 1: sc A misses, waits for BusRdX","caches":[{"lines":[{"st":"I","fresh":0}],"pend":"store A via BusRdX","wb":"","resv":""},{"lines":[{"st":"I","fresh":1}],"pend":"sc A via BusRdX","wb":"","resv":"A"}],"mem":[1],"bus":"cache 0 BusRdX A"},{"action":"cache 0: fill done, A is now M, performs its store","caches":[{"lines":[{"st":"M","fresh":1}],"pend":"","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"sc A via BusRdX","wb":"","resv":"A"}],"mem":[0],"bus":""},{"action":"bus: grants cache 1 BusRdX A","caches":[{"lines":[{"st":"M","fresh":1}],"pend":"","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"sc A via BusRdX","wb":"","resv":"A"}],"mem":[0],"bus":"cache 1 BusRdX A"},{"action":"cache 0: answers the snoop (M -> I), supplies the line","caches":[{"lines":[{"st":"I","fresh":1}],"pend":"","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"sc A via BusRdX","wb":"","resv":"A"}],"mem":[0],"bus":"cache 1 BusRdX A"},{"action":"cache 1: fill done, A is now M, performs its sc","caches":[{"lines":[{"st":"I","fresh":0}],"pend":"","wb":"","resv":""},{"lines":[{"st":"M","fresh":1}],"pend":"","wb":"","resv":""}],"mem":[0],"bus":""}]},"rtl":{"events":[{"c":2407,"h":1,"e":"hit","line":"80001790","op":"load","from":"M","to":"M","sc_ok":0},{"c":2408,"h":0,"e":"hit","line":"800fffa0","op":"store","from":"M","to":"M","sc_ok":0},{"c":2409,"h":0,"e":"hit","line":"800fffa0","op":"load","from":"M","to":"M","sc_ok":0},{"c":2410,"h":1,"e":"hit","line":"80001790","op":"load","from":"M","to":"M","sc_ok":0},{"c":2413,"h":1,"e":"hit","line":"80001790","op":"load","from":"M","to":"M","sc_ok":0},{"c":2415,"h":0,"e":"miss","line":"80001780","op":"sc","cmd":"BusRdX","victim":"-","vst":"-"},{"c":2416,"h":1,"e":"hit","line":"80001790","op":"load","from":"M","to":"M","sc_ok":0},{"c":2419,"h":1,"e":"hit","line":"80001790","op":"load","from":"M","to":"M","sc_ok":0},{"c":2422,"h":1,"e":"hit","line":"80001790","op":"load","from":"M","to":"M","sc_ok":0},{"c":2425,"h":1,"e":"hit","line":"80001790","op":"load","from":"M","to":"M","sc_ok":0},{"c":2428,"h":1,"e":"hit","line":"80001790","op":"load","from":"M","to":"M","sc_ok":0},{"c":2430,"h":0,"e":"grant","line":"80001780","cmd":"BusRdX"},{"c":2431,"h":1,"e":"hit","line":"80001790","op":"load","from":"M","to":"M","sc_ok":0},{"c":2433,"h":1,"e":"snoop","line":"80001780","cmd":"BusRdX","from":"M","to":"I","supply":1,"wb":0}],"reason":"MEMORY CHECK FAILED: cycle 2434: hart 0 SC at 80001780 succeeded although another hart wrote the line after this hart's LR (atomicity broken)","exit":6}},{"id":4,"prog":"e_shared","title":"Exclusive granted despite a sharer","explanation":"One cache reads a line (Exclusive, since nobody else has it). A second cache reads the same line: it must get Shared, and the first must drop to Shared too. The broken bus never reports the line as shared, so the second cache takes Exclusive and its next store is a silent E->M upgrade with no invalidation; the first cache keeps reading its stale copy.","model":{"bug":4,"name":"E despite a shared copy","caches":2,"addresses":1,"observable":true,"states":193,"violation":"a read returned a stale value","steps":[{"action":"initial state","caches":[{"lines":[{"st":"I","fresh":0}],"pend":"","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"","wb":"","resv":""}],"mem":[1],"bus":""},{"action":"cache 0: load A misses, waits for BusRd","caches":[{"lines":[{"st":"I","fresh":0}],"pend":"load A via BusRd","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"","wb":"","resv":""}],"mem":[1],"bus":""},{"action":"bus: grants cache 0 BusRd A","caches":[{"lines":[{"st":"I","fresh":0}],"pend":"load A via BusRd","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"","wb":"","resv":""}],"mem":[1],"bus":"cache 0 BusRd A"},{"action":"cache 1: load A misses, waits for BusRd","caches":[{"lines":[{"st":"I","fresh":0}],"pend":"load A via BusRd","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"load A via BusRd","wb":"","resv":""}],"mem":[1],"bus":"cache 0 BusRd A"},{"action":"cache 1: answers the snoop (I -> I)","caches":[{"lines":[{"st":"I","fresh":0}],"pend":"load A via BusRd","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"load A via BusRd","wb":"","resv":""}],"mem":[1],"bus":"cache 0 BusRd A"},{"action":"cache 0: fill done, A is now E, performs its load","caches":[{"lines":[{"st":"E","fresh":1}],"pend":"","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"load A via BusRd","wb":"","resv":""}],"mem":[1],"bus":""},{"action":"bus: grants cache 1 BusRd A","caches":[{"lines":[{"st":"E","fresh":1}],"pend":"","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"load A via BusRd","wb":"","resv":""}],"mem":[1],"bus":"cache 1 BusRd A"},{"action":"cache 0: answers the snoop (E -> S)","caches":[{"lines":[{"st":"S","fresh":1}],"pend":"","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"load A via BusRd","wb":"","resv":""}],"mem":[1],"bus":"cache 1 BusRd A"},{"action":"cache 1: fill done, A is now E, performs its load","caches":[{"lines":[{"st":"S","fresh":1}],"pend":"","wb":"","resv":""},{"lines":[{"st":"E","fresh":1}],"pend":"","wb":"","resv":""}],"mem":[1],"bus":""},{"action":"cache 1: store A hits (E)","caches":[{"lines":[{"st":"S","fresh":0}],"pend":"","wb":"","resv":""},{"lines":[{"st":"M","fresh":1}],"pend":"","wb":"","resv":""}],"mem":[0],"bus":""},{"action":"cache 0: load A hits (S)","caches":[{"lines":[{"st":"S","fresh":0}],"pend":"","wb":"","resv":""},{"lines":[{"st":"M","fresh":1}],"pend":"","wb":"","resv":""}],"mem":[0],"bus":""}]},"rtl":{"events":[{"c":817,"h":1,"e":"hit","line":"80001710","op":"load","from":"E","to":"E","sc_ok":0},{"c":819,"h":0,"e":"hit","line":"80001700","op":"store","from":"M","to":"M","sc_ok":0},{"c":820,"h":1,"e":"hit","line":"80001710","op":"load","from":"E","to":"E","sc_ok":0},{"c":823,"h":0,"e":"miss","line":"80001710","op":"store","cmd":"BusRdX","victim":"-","vst":"-"},{"c":823,"h":1,"e":"hit","line":"80001710","op":"load","from":"E","to":"E","sc_ok":0},{"c":824,"h":0,"e":"grant","line":"80001710","cmd":"BusRdX"},{"c":826,"h":1,"e":"hit","line":"80001710","op":"load","from":"E","to":"E","sc_ok":0},{"c":827,"h":1,"e":"snoop","line":"80001710","cmd":"BusRdX","from":"E","to":"I","supply":0,"wb":0},{"c":829,"h":1,"e":"miss","line":"80001710","op":"load","cmd":"BusRd","victim":"-","vst":"-"},{"c":839,"h":0,"e":"fill","line":"80001710","cmd":"BusRdX","op":"store","to":"M","sc_ok":0},{"c":840,"h":1,"e":"grant","line":"80001710","cmd":"BusRd"},{"c":843,"h":0,"e":"snoop","line":"80001710","cmd":"BusRd","from":"M","to":"S","supply":1,"wb":0},{"c":844,"h":0,"e":"miss","line":"80001710","op":"store","cmd":"BusUpgr","victim":"-","vst":"-"},{"c":855,"h":1,"e":"fill","line":"80001710","cmd":"BusRd","op":"load","to":"E","sc_ok":0}],"reason":"MODEL DISAGREES at cycle 855: hart 1, line 80001710: single-writer/multiple-reader violated","exit":7}},{"id":5,"prog":"lockout","title":"LR lock-out with no timeout","explanation":"To give an LR/SC loop a chance to make progress, snoops to a freshly reserved line are deferred for a short window. The window must always close. The broken cache defers forever: a hart that holds a reservation and waits (on a flag another hart will set) blocks that other hart's store indefinitely - a deadlock the bus cannot break.","model":{"bug":5,"name":"LR lock-out without timeout","caches":2,"addresses":1,"observable":true,"states":36,"violation":"a request can never finish (no progress)","steps":[{"action":"initial state","caches":[{"lines":[{"st":"I","fresh":0}],"pend":"","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"","wb":"","resv":""}],"mem":[1],"bus":""},{"action":"cache 0: lr A misses, waits for BusRdX","caches":[{"lines":[{"st":"I","fresh":0}],"pend":"lr A via BusRdX","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"","wb":"","resv":""}],"mem":[1],"bus":""},{"action":"cache 1: lr A misses, waits for BusRdX","caches":[{"lines":[{"st":"I","fresh":0}],"pend":"lr A via BusRdX","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"lr A via BusRdX","wb":"","resv":""}],"mem":[1],"bus":""},{"action":"bus: grants cache 0 BusRdX A","caches":[{"lines":[{"st":"I","fresh":0}],"pend":"lr A via BusRdX","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"lr A via BusRdX","wb":"","resv":""}],"mem":[1],"bus":"cache 0 BusRdX A"},{"action":"cache 1: answers the snoop (I -> I)","caches":[{"lines":[{"st":"I","fresh":0}],"pend":"lr A via BusRdX","wb":"","resv":""},{"lines":[{"st":"I","fresh":0}],"pend":"lr A via BusRdX","wb":"","resv":""}],"mem":[1],"bus":"cache 0 BusRdX A"},{"action":"cache 0: fill done, A is now M, performs its lr","caches":[{"lines":[{"st":"M","fresh":1}],"pend":"","wb":"","resv":"A, lock-out"},{"lines":[{"st":"I","fresh":0}],"pend":"lr A via BusRdX","wb":"","resv":""}],"mem":[1],"bus":""},{"action":"bus: grants cache 1 BusRdX A","caches":[{"lines":[{"st":"M","fresh":1}],"pend":"","wb":"","resv":"A, lock-out"},{"lines":[{"st":"I","fresh":0}],"pend":"lr A via BusRdX","wb":"","resv":""}],"mem":[1],"bus":"cache 1 BusRdX A"},{"action":"stuck: the bus waits for cache 0, which defers the snoop until its own core performs an SC - no protocol action is left","caches":[{"lines":[{"st":"M","fresh":1}],"pend":"","wb":"","resv":"A, lock-out"},{"lines":[{"st":"I","fresh":0}],"pend":"lr A via BusRdX","wb":"","resv":""}],"mem":[1],"bus":"cache 1 BusRdX A"}]},"rtl":{"events":[{"c":149958,"h":0,"e":"hit","line":"80001720","op":"load","from":"M","to":"M","sc_ok":0},{"c":149961,"h":0,"e":"hit","line":"80001720","op":"load","from":"M","to":"M","sc_ok":0},{"c":149964,"h":0,"e":"hit","line":"80001720","op":"load","from":"M","to":"M","sc_ok":0},{"c":149967,"h":0,"e":"hit","line":"80001720","op":"load","from":"M","to":"M","sc_ok":0},{"c":149970,"h":0,"e":"hit","line":"80001720","op":"load","from":"M","to":"M","sc_ok":0},{"c":149973,"h":0,"e":"hit","line":"80001720","op":"load","from":"M","to":"M","sc_ok":0},{"c":149976,"h":0,"e":"hit","line":"80001720","op":"load","from":"M","to":"M","sc_ok":0},{"c":149979,"h":0,"e":"hit","line":"80001720","op":"load","from":"M","to":"M","sc_ok":0},{"c":149982,"h":0,"e":"hit","line":"80001720","op":"load","from":"M","to":"M","sc_ok":0},{"c":149985,"h":0,"e":"hit","line":"80001720","op":"load","from":"M","to":"M","sc_ok":0},{"c":149988,"h":0,"e":"hit","line":"80001720","op":"load","from":"M","to":"M","sc_ok":0},{"c":149991,"h":0,"e":"hit","line":"80001720","op":"load","from":"M","to":"M","sc_ok":0},{"c":149994,"h":0,"e":"hit","line":"80001720","op":"load","from":"M","to":"M","sc_ok":0},{"c":149997,"h":0,"e":"hit","line":"80001720","op":"load","from":"M","to":"M","sc_ok":0}],"reason":"vsmp: no exit after 150000 cycles","exit":3}}]}}</script>
+<script>
+"use strict";
+var D = JSON.parse(document.getElementById("data").textContent);
+function el(t, cls, txt){ var e=document.createElement(t); if(cls)e.className=cls; if(txt!=null)e.textContent=txt; return e; }
+function tableFrom(rows, numFrom){
+  var t=el("table"); if(!rows||!rows.length) return t;
+  var thead=el("thead"), tr=el("tr");
+  rows[0].forEach(function(h,i){ var th=el("th",i>=numFrom?"num":null,h); tr.appendChild(th); });
+  thead.appendChild(tr); t.appendChild(thead);
+  var tb=el("tbody");
+  rows.slice(1).forEach(function(r){ var x=el("tr"); r.forEach(function(c,i){ x.appendChild(el("td",i>=numFrom?"num":null,c)); }); tb.appendChild(x); });
+  t.appendChild(tb); return t;
+}
+function put(id, node){ var h=document.getElementById(id); if(h) h.appendChild(node); }
+
+// glance
+(function(){
+  var g=el("table"), tb=el("tbody");
+  function row(k,v){ var tr=el("tr"); tr.appendChild(el("th",null,k)); tr.appendChild(el("td",null,v)); tb.appendChild(tr); }
+  var big = D.mc_correct.length? D.mc_correct[D.mc_correct.length-1] : null;
+  if(big) row("Largest model check", big[0]+" caches × "+big[1]+" addresses: "+big[2]+" states, "+big[6]);
+  row("Protocol bugs reproduced", (D.museum.bugs?D.museum.bugs.length:0)+" (model counterexample + RTL)");
+  if(D.mandel.length>3) row("Mandelbrot speed-up (4 cores)", D.mandel[3][2]);
+  row("False-sharing fix", D.false_sharing+" faster");
+  if(D.synth.length) row("Synthesis (2 harts)", D.synth[2][1]+" LUTs, "+D.synth[2][3]+" FFs (XC7S50)");
+  g.appendChild(tb); put("glance",g);
+})();
+
+put("mc_correct", tableFrom(D.mc_correct, 2));
+put("mc_bugs", tableFrom(D.mc_bugs, 2));
+put("mandel", tableFrom(D.mandel, 1));
+put("hist", tableFrom(D.hist, 1));
+put("synth", tableFrom(D.synth, 1));
+document.getElementById("fs").textContent = D.false_sharing;
+
+// mandelbrot speed-up bars
+(function(){
+  if(D.mandel.length<2) return;
+  var host=document.getElementById("mandelbar");
+  var base=parseFloat(D.mandel[1][2]);
+  D.mandel.slice(1).forEach(function(r){
+    var sp=parseFloat(r[2]);
+    var row=el("div","barrow");
+    row.appendChild(el("span","lbl",r[0]+" cores"));
+    var bar=el("div","bar"); bar.style.width=(sp/parseFloat(D.mandel[D.mandel.length-1][2])*280)+"px";
+    row.appendChild(bar); row.appendChild(el("span","val",r[2]+" ("+r[1]+" cyc)"));
+    host.appendChild(row);
+  });
+})();
+
+// litmus
+(function(){
+  if(!D.litmus){ return; }
+  var rows=[["test","threads","runs","relaxed (non-SC) outcomes seen"]];
+  D.litmus.tests.forEach(function(t){ if(t.ran) rows.push([t.name, ""+t.threads, ""+t.runs, ""+t.relaxed]); });
+  put("litmus", tableFrom(rows, 1));
+  var p=el("p","muted","All "+(D.litmus.tests.filter(function(t){return t.ran;}).length)+" tests: 0 relaxed outcomes over "+
+    D.litmus.runs_per_test+" runs each — sequentially consistent, stronger than RVWMO requires.");
+  put("litmus",p);
+})();
+
+// bug museum
+(function(){
+  var bugs = (D.museum.bugs)||[];
+  var tabs=document.getElementById("bugtabs"), panel=document.getElementById("bugpanel");
+  function stateCell(line){
+    var span=el("span","st "+line.st, line.st);
+    if(line.st!=="I" && line.fresh===0) span.className+=" stale";
+    return span;
+  }
+  function render(b){
+    panel.innerHTML="";
+    var box=el("div","bug");
+    box.appendChild(el("h3",null,"Bug "+b.id+": "+b.title));
+    box.appendChild(el("div","expl",b.explanation));
+    // model timeline
+    if(b.model && b.model.steps){
+      box.appendChild(el("p",null,"Model checker, shortest counterexample ("+(b.model.steps.length-1)+
+        " steps to "+b.model.violation+"):"));
+      var wrap=el("div","timeline"), t=el("table","tl"), thead=el("thead"), tr=el("tr");
+      var nc=b.model.steps[0].caches.length, na=b.model.steps[0].caches[0].lines.length;
+      tr.appendChild(el("th",null,"#"));
+      for(var c=0;c<nc;c++) tr.appendChild(el("th",null,"cache "+c));
+      tr.appendChild(el("th",null,"memory"));
+      tr.appendChild(el("th",null,"bus"));
+      tr.appendChild(el("th",null,"action"));
+      thead.appendChild(tr); t.appendChild(thead);
+      var tb=el("tbody");
+      b.model.steps.forEach(function(s,si){
+        var x=el("tr");
+        x.appendChild(el("td",null,""+si));
+        s.caches.forEach(function(cc){
+          var td=el("td"); var inner=el("span","cell");
+          cc.lines.forEach(function(ln,li){
+            if(na>1){ inner.appendChild(el("span","mono", "ABCD"[li]+":")); }
+            inner.appendChild(stateCell(ln));
+          });
+          if(cc.resv){ inner.appendChild(el("span","mono"," ⦿"+cc.resv)); }
+          if(cc.wb){ inner.appendChild(el("span","mono"," wb:"+cc.wb)); }
+          if(cc.pend){ inner.appendChild(el("span","mono"," ("+cc.pend+")")); }
+          td.appendChild(inner); x.appendChild(td);
+        });
+        x.appendChild(el("td","mono", s.mem.map(function(m,i){return (na>1?"ABCD"[i]+":":"")+(m?"cur":"stale");}).join(" ")));
+        x.appendChild(el("td","mono", s.bus||""));
+        x.appendChild(el("td","act", s.action));
+        tb.appendChild(x);
+      });
+      t.appendChild(tb); wrap.appendChild(t); box.appendChild(wrap);
+    }
+    // RTL reproduction
+    if(b.rtl){
+      var caught = b.rtl.exit!==0;
+      var p=el("p"); p.appendChild(document.createTextNode("RTL reproduction on the buggy build: "));
+      p.appendChild(el("span","badge "+(caught?"bad":"ok"), caught?"caught":"passed"));
+      box.appendChild(p);
+      if(b.rtl.reason) box.appendChild(el("p","mono", b.rtl.reason));
+      if(b.rtl.events && b.rtl.events.length){
+        var det=el("details"); det.appendChild(el("summary",null,"coherence events just before the failure"));
+        var log=el("div","evlog");
+        b.rtl.events.forEach(function(e){
+          log.appendChild(el("div","mono","cyc "+e.c+"  hart "+e.h+"  "+e.e+"  "+(e.line||"")+"  "+
+            (e.cmd||"")+" "+(e.op||"")+(e.to?(" → "+e.to):"")+(e.from?(" (from "+e.from+")"):"")));
+        });
+        det.appendChild(log); box.appendChild(det);
+      }
+    }
+    panel.appendChild(box);
+  }
+  bugs.forEach(function(b,i){
+    var t=el("div","tab", b.id+". "+b.title);
+    t.setAttribute("role","tab"); t.setAttribute("aria-selected", i===0?"true":"false");
+    t.addEventListener("click", function(){
+      Array.prototype.forEach.call(tabs.children, function(c){ c.setAttribute("aria-selected","false"); });
+      t.setAttribute("aria-selected","true"); render(b);
+    });
+    tabs.appendChild(t);
+  });
+  if(bugs.length) render(bugs[0]);
+})();
+</script>
+</body>
+</html>

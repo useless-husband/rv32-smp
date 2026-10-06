@@ -160,6 +160,7 @@ loopcheck:
 # ----------------------------------------------------------------- tests
 .PHONY: mc mc-bugs system soak litmus museum bench mutants synth report demo
 mc: build/mc
+	@mkdir -p build/museum
 	./build/mc --all | tee build/mc.md
 
 system: $(SIMS) $(BUG_SIMS) rvtests sw build/rvsim

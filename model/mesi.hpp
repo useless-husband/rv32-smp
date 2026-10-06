@@ -286,32 +286,39 @@ template <int MA> void timeout(State<MA> &s, int c) { s.young[c] = 0; }
 
 // Progress: can the protocol alone (grants, snoop answers, completions,
 // write-backs, lock-out timeouts - no new core accesses) bring the system to
-// a state with no request, no buffered write-back and an idle bus?  The only
-// thing a snoop answer can wait for is the lock-out, so the greedy schedule
-// below is exact.  Returns true if it can.
-template <int MA> bool drains(State<MA> s, const Cfg &k)
+// a state with no request, no buffered write-back and an idle bus?  A
+// depth-first search over those actions only; returns true if some order
+// gets there.  (One fixed order is not enough: in the lock-out bug, granting
+// the LR first strands a later load, granting the load first does not.)
+template <int MA> bool drains(const State<MA> &s0, const Cfg &k, int depth = 0)
 {
     Cfg q = k;
     q.track_data = false;
-    for (int step = 0; step < 64; step++) {
-        if (s.busy) {
-            if (can_complete(s)) { complete(s, q); continue; }
-            bool moved = false;
-            for (int d = 0; d < k.n && !moved; d++)
-                if (can_snoop(s, d)) { snoop(s, q, d); moved = true; }
-            for (int d = 0; d < k.n && !moved; d++)
-                if (((s.need >> d) & 1) && can_timeout(s, k, d)) { timeout(s, d); moved = true; }
-            if (!moved) return false;
-            continue;
-        }
-        bool moved = false;
-        for (int c = 0; c < k.n && !moved; c++)
-            if (can_grant(s, c)) { grant(s, q, c); moved = true; }
-        for (int c = 0; c < k.n && !moved; c++)
-            if (can_grant_wb(s, c)) { grant_wb(s, q, c); moved = true; }
-        if (!moved) return true;
+    if (depth > 48) return false;
+    if (s0.busy) {
+        if (can_complete(s0)) { State<MA> s = s0; complete(s, q); return drains(s, k, depth + 1); }
+        for (int d = 0; d < k.n; d++)
+            if (can_snoop(s0, d)) { State<MA> s = s0; snoop(s, q, d); return drains(s, k, depth + 1); }
+        for (int d = 0; d < k.n; d++)
+            if (((s0.need >> d) & 1) && can_timeout(s0, k, d)) { State<MA> s = s0; timeout(s, d); return drains(s, k, depth + 1); }
+        return false;
     }
-    return false;
+    bool any = false;
+    for (int c = 0; c < k.n; c++) {
+        if (can_grant(s0, c)) {
+            any = true;
+            State<MA> s = s0;
+            grant(s, q, c);
+            if (drains(s, k, depth + 1)) return true;
+        }
+        if (can_grant_wb(s0, c)) {
+            any = true;
+            State<MA> s = s0;
+            grant_wb(s, q, c);
+            if (drains(s, k, depth + 1)) return true;
+        }
+    }
+    return !any;
 }
 
 // ===================================================================
